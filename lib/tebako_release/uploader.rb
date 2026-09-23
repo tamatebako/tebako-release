@@ -254,7 +254,7 @@ module TebakoRelease
       []
     end
 
-    # Metadata files always REPLACE on drift, regardless of FORCE_REBUILD:
+    # Metadata files always REPLACE on drift (payload assets never do):
     # unlike payload assets (byte-immutable per name), every metadata file
     # is DERIVABLE — a pure function of the packages' served bytes — so a
     # same-named metadata asset with different bytes is debris from an
@@ -612,7 +612,7 @@ module TebakoRelease
         rescue Octokit::UnprocessableEntity, *TRANSIENT_ERRORS => e
           # A 422 means the asset name is taken. Two distinct causes: the
           # eventual-consistency race after a same-name delete (the
-          # FORCE_REBUILD / content-changed path), or a previous attempt's
+          # content-changed recovery paths), or a previous attempt's
           # POST that timed out but LANDED server-side — the retry then 422s
           # (the v0.16.1 publish died on exactly this). Resolve by content,
           # first: a name-only check would misread the delete-race, where
@@ -767,8 +767,8 @@ module TebakoRelease
     end
 
     # A leg's publish writes ONLY names this leg owns (the de-rendezvous —
-    # spec 13 §2a): the payload assets (byte-immutable keep / FORCE_REBUILD
-    # replace machinery) and each package's own metadata — its
+    # spec 13 §2a): the payload assets (byte-immutable per name,
+    # absolutely) and each package's own metadata — its
     # `<asset>.sha256` sidecars and its `<stem>.manifest.json` shard. No
     # shared file exists: the monoliths are consumer-side derivations and
     # the release notes are written once at creation.
@@ -779,7 +779,7 @@ module TebakoRelease
     end
 
     # The package's metadata assets, byte-truthful for the SERVED bytes: a
-    # settled package (the byte-immutable keep, or a wedged FORCE_REBUILD
+    # settled package (the byte-immutable keep, or a wedged recovery
     # replace) publishes the PREVIOUS entry's shard and sidecars — the
     # metadata describes what the release serves, never the fresh bytes
     # that did not land.
@@ -1274,7 +1274,7 @@ module TebakoRelease
       puts "Processing #{filename}..."
       if settled?(filename)
         puts "#{filename} kept its previous bytes earlier in this publish run — " \
-             "the settled asset is never re-attempted; the refresh lands on a FORCE_REBUILD publish"
+             "the settled asset is never re-attempted; the refresh lands on a republish onto a recreated release object"
         return nil
       end
       return filename if skip_existing_asset?(release, filename)
@@ -1283,12 +1283,15 @@ module TebakoRelease
       filename
     rescue Octokit::UnprocessableEntity
       # The wedged-name class: a delete+recreate tonight 422s for hours —
-      # the replace cannot land within the budget. Only a FORCE_REBUILD
-      # replace reaches this rescue now (a plain re-publish's byte-differing
-      # assets warn-keep in skip_existing_asset? before any delete). Keep
+      # the replace cannot land within the budget. Only the recovery
+      # replaces reach this rescue now (byte-differing assets warn-keep in
+      # skip_existing_asset? before any delete — byte-immutable per name,
+      # absolutely: a forced republication recreates the release OBJECT
+      # coordinator-side, never an asset here). Keep
       # the release's existing asset AND its previous manifest entry
       # (byte-truthful, never a mismatch) and complete the publish; the
-      # refreshed bytes land on a later FORCE_REBUILD publish. A
+      # refreshed bytes land on a later republish onto a recreated release
+      # object. A
       # never-published asset has nothing to keep — that re-raises by name.
       # Facets count: the manifest keys a .tfs/.dll under its package's
       # entry, so the facet's previous bytes live in the package entry's
@@ -1298,7 +1301,8 @@ module TebakoRelease
       raise if previous_entry_covering(filename).nil?
 
       puts "::warning::#{filename} could not replace the wedged asset — " \
-           "keeping the previous asset + manifest entry (byte-truthful); the refresh lands on a FORCE_REBUILD publish"
+           "keeping the previous asset + manifest entry (byte-truthful); " \
+           "the refresh lands on a recreated-object republish"
       settle_asset!(filename)
       nil
     end
@@ -1306,7 +1310,7 @@ module TebakoRelease
     # The settled ledger — the durable half of warn-and-keep-previous. The
     # publish step runs the uploader once per platform (sequential
     # processes, one workspace); an asset settled in one invocation (the
-    # byte-immutable keep, or a wedged FORCE_REBUILD replace) must NEVER be
+    # byte-immutable keep, or a wedged recovery replace) must NEVER be
     # re-attempted by a later one (the 2026-08-20 publish re-attempted the
     # same wedged exe once per platform invocation and burned the whole
     # 150-minute job timeout doing it). The ledger file in the workspace
@@ -1350,18 +1354,18 @@ module TebakoRelease
 
     # The end-of-step summary: every package that kept its previous bytes
     # this run, in one loud block. The step still exits green — the design
-    # is byte-truthful keep-previous, refresh on a FORCE_REBUILD publish.
+    # is byte-truthful keep-previous, refresh on a recreated-object republish.
     def print_settled_summary
       return if settled_stems.empty?
 
       puts "=" * 78
       puts "Publish summary: #{settled_stems.size} package(s) kept their previous bytes this run"
-      puts "(byte-immutable per name — byte-truthful keep-previous; the refresh lands on a FORCE_REBUILD publish):"
+      puts "(byte-immutable per name — byte-truthful keep-previous; the refresh lands on a recreated-object republish):"
       settled_stems.sort.each { |stem| puts "  - #{stem} (executable and its .tfs/.dll facets)" }
       puts "=" * 78
     end
 
-    # A kept asset (the byte-immutable keep, or a wedged FORCE_REBUILD
+    # A kept asset (the byte-immutable keep, or a wedged recovery
     # replace) keeps the release's previous bytes, so its published metadata
     # speaks with the previous ENTRY's voice (the served bytes' sha, never
     # the fresh one that did not land) — for the exe and its .tfs/.dll
@@ -1383,11 +1387,16 @@ module TebakoRelease
 
     # An asset with the same name AND the same bytes is kept — an
     # unchanged artifact never re-uploads. A same-named asset whose bytes
-    # DIFFER is kept too, loudly, unless FORCE_REBUILD — a published
-    # release's payload assets are byte-immutable per name (owner-locked):
-    # the build is not bit-reproducible, and the delete+re-upload of a
-    # differing same-name asset is exactly what wedged names server-side
-    # on the 0.16.6 re-publish. Presence in the listing alone still proves
+    # DIFFER is kept too, loudly — a published release's payload assets
+    # are byte-immutable per name, absolutely (owner-locked): the build
+    # is not bit-reproducible, and the delete+re-upload of a differing
+    # same-name asset is exactly what wedged names server-side on the
+    # 0.16.6 re-publish — and the 0.16.28 republish (tebako-runtime-ruby#189):
+    # a FORCE_REBUILD delete→re-upload wedged 51 legs at once, and only
+    # recreating the release OBJECT freed the names. Force republication
+    # therefore happens coordinator-side (the publish workflow deletes and
+    # re-creates the release object before any leg fans out), never
+    # per-asset here. Presence in the listing alone still proves
     # nothing (the v0.16.3 publish kept a never-committed "starter" stub
     # as "unchanged"): uncommitted stubs force the replace first, and a
     # digest-mismatched asset the previous manifest does not cover takes
@@ -1395,7 +1404,6 @@ module TebakoRelease
     def skip_existing_asset?(release, filename)
       return false unless find_asset(release, filename)
       return false if uncommitted_asset?(release, filename)
-      return false if force_replace_asset?(release, filename)
       return true if keep_published_asset?(release, filename)
       return false if digest_mismatch_without_previous_entry?(release, filename)
 
@@ -1434,18 +1442,6 @@ module TebakoRelease
       true
     end
 
-    # FORCE_REBUILD is the one exception to per-name byte-immutability:
-    # the existing asset is deleted so the caller re-uploads (GitHub
-    # deletion is only eventually consistent; the upload retry absorbs the
-    # 422s, and a name that stays wedged warn-keeps at the upload_package
-    # rescue).
-    def force_replace_asset?(release, filename)
-      return false unless ENV["FORCE_REBUILD"] == "true"
-
-      remove_existing_asset(release, filename)
-      true
-    end
-
     # Byte-immutability keep (owner-locked): the release already carries an
     # asset under this name and its published bytes differ from the local
     # package's — the listing's server-computed digest is the authority,
@@ -1467,7 +1463,7 @@ module TebakoRelease
 
       puts "::warning::#{filename} exists on the release with different bytes " \
            "(published #{published[0, 12]}…, local #{current[0, 12]}…) — byte-immutable per name; keeping the " \
-           "previous asset + manifest entry (byte-truthful); the refresh lands on a FORCE_REBUILD publish"
+           "previous asset + manifest entry (byte-truthful); the refresh lands on a recreated-object republish"
       settle_asset!(filename)
       true
     end

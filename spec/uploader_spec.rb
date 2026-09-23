@@ -738,20 +738,20 @@ RSpec.describe TebakoRelease::Uploader do
       expect(store.deletes).to eq([7])
     end
 
-    # A FORCE_REBUILD replace whose name wedges server-side (the replace
-    # cannot land within the budget) keeps the previous asset AND its
-    # previous entry — byte-truthful, loudly warned, never a failed
-    # publish. (Without FORCE_REBUILD the byte-immutable keep pre-empts
-    # the replace entirely — this wedge path is the force-replace's
-    # safety net.) The settled package's published metadata then speaks
-    # with the previous entry's voice (effective_entry).
+    # A recovery replace whose name wedges server-side (the replace cannot
+    # land within the budget) keeps the previous entry — byte-truthful,
+    # loudly warned, never a failed publish; the completeness gate remains
+    # the arbiter of what the release actually serves. (Byte-differing
+    # assets warn-keep before any delete — this rescue is the recovery
+    # paths' safety net; the trigger below is the never-committed "starter"
+    # stub.) The settled package's published metadata then speaks with the
+    # previous entry's voice (effective_entry).
     it "keeps the previous asset and entry when the replace cannot land" do
-      ENV["FORCE_REBUILD"] = "true"
       exe = package("tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64")
       url = "https://download.test/#{exe.basename}"
       previous = { filename: exe.basename.to_s, sha256: "1" * 64, platform: "macos-arm64" }
       store.delete_propagation = 999 # the delete never clears the listing
-      store.assets << FakeAsset.new(7, exe.basename.to_s, url)
+      store.assets << FakeAsset.new(7, exe.basename.to_s, url, nil, "starter")
       store.set_content(url, "previous bytes")
       allow(fake_manager).to receive(:previous_manifest_entries).and_return([previous])
       allow(fake_manager).to receive(:current_shas)
@@ -820,9 +820,14 @@ RSpec.describe TebakoRelease::Uploader do
     # is trivially green, so the operative half is the grace), and the
     # retry lands instead of burning the per-asset budget on blind POSTs.
     it "re-cycles the deletion wait once more when a 422 outlives the listing absence" do
-      ENV["FORCE_REBUILD"] = "true"
+      # The recovery replace's trigger: the listed digest disagrees with
+      # the local bytes and no previous entry covers the name.
       exe = package("tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64")
-      store.assets << FakeAsset.new(7, exe.basename.to_s, "https://download.test/#{exe.basename}")
+      asset = FakeAsset.new(7, exe.basename.to_s, "https://download.test/#{exe.basename}")
+      asset.digest = "sha256:#{"1" * 64}"
+      store.assets << asset
+      allow(fake_manager).to receive(:current_shas)
+        .and_return(exe.basename.to_s => Digest::SHA256.hexdigest(exe.read))
       store.fail_next(:upload, Octokit::UnprocessableEntity.new) # the name is still blocked though unlisted
 
       fake_manager.upload_package(release, exe)
@@ -965,7 +970,7 @@ RSpec.describe TebakoRelease::Uploader do
       expect(calls).to eq(2)
     end
 
-    it "keeps an existing asset unless FORCE_REBUILD is set" do
+    it "keeps an existing asset (byte-immutable per name, absolutely)" do
       store.assets << FakeAsset.new(7, "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64")
       exe = package("tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64")
 
@@ -974,15 +979,19 @@ RSpec.describe TebakoRelease::Uploader do
       expect(store.deletes).to be_empty
     end
 
-    it "deletes then re-uploads an existing asset under FORCE_REBUILD" do
+    # tebako-runtime-ruby#189: a FORCE_REBUILD delete→re-upload wedged 51
+    # legs of the 0.16.28 republish; only recreating the release OBJECT
+    # freed the names. The env is inert uploader-side now — force
+    # republication is the coordinator's recreate-the-object, never a
+    # per-asset delete here.
+    it "keeps the asset even with FORCE_REBUILD set (the env is inert uploader-side)" do
       ENV["FORCE_REBUILD"] = "true"
       store.assets << FakeAsset.new(7, "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64")
       exe = package("tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64")
 
-      fake_manager.upload_package(release, exe)
-
-      expect(store.deletes).to eq([7])
-      expect(store.uploads).to eq([exe.basename.to_s])
+      expect(fake_manager.upload_package(release, exe)).to eq(exe.basename.to_s)
+      expect(store.uploads).to be_empty
+      expect(store.deletes).to be_empty
     end
 
     it "looks assets up through the paginated assets rel, not the embedded array" do
@@ -1427,10 +1436,11 @@ RSpec.describe TebakoRelease::Uploader do
     # always differs from the published bytes — and the delete+re-upload
     # of a differing same-name asset is exactly what wedged the name
     # server-side (POST 422 cycles ~7 min apart until the per-asset
-    # budget died). Same name + different bytes + no FORCE_REBUILD keeps
+    # budget died). Same name + different bytes keeps
     # the published asset — no delete, no upload, a loud ::warning naming
     # both shas — and the manifest entry reverts to the published sha
-    # (byte-truthful). The refresh needs a FORCE_REBUILD publish.
+    # (byte-truthful). The refresh needs a republish onto a recreated
+    # release object (the coordinator's force_rebuild).
     it "keeps the published asset when the rebuilt bytes differ (byte-immutable per name)" do
       exe = package("tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64")
       store.assets << FakeAsset.new(7, exe.basename.to_s)
@@ -1458,9 +1468,10 @@ RSpec.describe TebakoRelease::Uploader do
       expect(store.deletes).to be_empty
     end
 
-    # FORCE_REBUILD is the one exception to byte-immutability: the
-    # replace path (delete + re-upload) runs exactly as before.
-    it "replaces a byte-differing published asset under FORCE_REBUILD" do
+    # No uploader-side exception to byte-immutability (tebako-runtime-ruby#189):
+    # FORCE_REBUILD set, previous entry covering, bytes differing — the keep
+    # still stands; the refresh is the coordinator's recreated release object.
+    it "keeps a byte-differing published asset even under FORCE_REBUILD" do
       ENV["FORCE_REBUILD"] = "true"
       exe = package("tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64")
       store.assets << FakeAsset.new(7, exe.basename.to_s)
@@ -1469,9 +1480,9 @@ RSpec.describe TebakoRelease::Uploader do
 
       fake_manager.upload_package(release, exe)
 
-      expect(store.deletes).to eq([7])
-      expect(store.uploads).to eq([exe.basename.to_s])
-      expect(fake_manager.settled?(exe.basename.to_s)).to be(false)
+      expect(store.deletes).to be_empty
+      expect(store.uploads).to be_empty
+      expect(fake_manager.settled?(exe.basename.to_s)).to be(true)
     end
 
     it "keeps an existing asset when the previous manifest is unreadable (fail conservative)" do
