@@ -27,7 +27,7 @@ when "upload"
 when "sign"
   begin
     TebakoRelease::Signer.new.sign_release
-  rescue TebakoRelease::Signer::SigningGateError, KeyError => e
+  rescue TebakoRelease::Signer::SigningGateError, TebakoRelease::Error, KeyError => e
     warn e.message
     exit 1
   end
