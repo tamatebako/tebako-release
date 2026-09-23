@@ -91,7 +91,9 @@ module TebakoRelease
       @config = config || TebakoRelease.config
       @client = client || Octokit::Client.new(access_token: @env.fetch("GITHUB_TOKEN"), auto_paginate: true)
       @executor = executor || ShellExecutor.new
-      @tag = "v#{@env.fetch("TEBAKO_VERSION")}"
+      # TEBAKO_RELEASE_TAG decouples the target tag from the version
+      # (the line-shard republication; asset names stay version-branded).
+      @tag = @env.fetch("TEBAKO_RELEASE_TAG") { "v#{@env.fetch("TEBAKO_VERSION")}" }
     end
 
     # The one public verb. Returns :disarmed or :signed.
