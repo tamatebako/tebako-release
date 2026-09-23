@@ -81,7 +81,7 @@ class FakeRelease
 end
 
 class FakeAssetStore
-  attr_reader :assets, :uploads, :deletes, :updates, :attempts, :upload_content_types, :creates
+  attr_reader :assets, :uploads, :deletes, :updates, :attempts, :upload_content_types, :creates, :create_tags
   attr_accessor :manifest_json, :delete_propagation, :page_size
 
   def initialize(names = [])
@@ -99,6 +99,7 @@ class FakeAssetStore
     @deletes = []
     @updates = []
     @creates = []
+    @create_tags = []
     @attempts = Hash.new(0)
     @upload_content_types = {}
     @contents = {}
@@ -199,8 +200,9 @@ class FakeClient
 
   # The release-create seam: races are scriptable via fail_next(:create, …)
   # (a concurrent winner's 422), and every create records its notes body.
-  def create_release(_repo, _tag, **opts)
+  def create_release(_repo, tag, **opts)
     @store.attempt(:create)
+    @store.create_tags << tag
     @store.creates << opts
     @release
   end
@@ -246,7 +248,7 @@ end
 RSpec.describe TebakoRelease::Uploader do
   around do |example|
     old = %w[GITHUB_TOKEN TEBAKO_VERSION EXPECTED_ENV_MATRIX EXPECTED_RUBY_MATRIX FORCE_REBUILD AUDIT_ONLY
-             BACKFILL_METADATA TEBAKO_PUBLISH_SETTLED_PATH
+             BACKFILL_METADATA TEBAKO_PUBLISH_SETTLED_PATH TEBAKO_RELEASE_TAG
              TEBAKO_RELEASE_SIGNING_ENABLED TEBAKO_RELEASE_SIGNING_KEYID].to_h { |key| [key, ENV.fetch(key, nil)] }
     ENV["GITHUB_TOKEN"] = "test-token"
     ENV["TEBAKO_VERSION"] = SPEC_VERSION
@@ -254,6 +256,7 @@ RSpec.describe TebakoRelease::Uploader do
     ENV["EXPECTED_RUBY_MATRIX"] = '["3.3.7"]'
     ENV.delete("FORCE_REBUILD")
     ENV.delete("BACKFILL_METADATA")
+    ENV.delete("TEBAKO_RELEASE_TAG")
     ENV.delete("TEBAKO_RELEASE_SIGNING_ENABLED")
     ENV.delete("TEBAKO_RELEASE_SIGNING_KEYID")
     Dir.mktmpdir do |dir|
@@ -1733,6 +1736,17 @@ RSpec.describe TebakoRelease::Uploader do
       # asset enumeration (a read-modify-write in disguise).
       expect(body).to include("manifest.json` shard", "release-index entry", "tpkg-registry.yaml")
       expect(body).not_to include("### macOS", "### Windows")
+    end
+
+    it "targets TEBAKO_RELEASE_TAG when set (the line-shard override)" do
+      ENV["TEBAKO_RELEASE_TAG"] = "v#{SPEC_VERSION}-ruby9.9"
+      allow(client).to receive(:release_for_tag).and_raise(Octokit::NotFound)
+
+      # Fresh manager: the describe's before hook instantiates the let
+      # (for the sleep stub) before this example's env is set.
+      described_class.new(client: client).get_or_create_release
+
+      expect(store.create_tags).to eq(["v#{SPEC_VERSION}-ruby9.9"])
     end
 
     it "rides the winner's release when the create loses the race (422)" do

@@ -19,7 +19,7 @@ SignSpecRelease = Struct.new(:url, :tag_name)
 # the assets with the digest of its bytes, so the convergence poll sees
 # exactly what the real edge would).
 class FakeSignClient
-  attr_reader :uploads, :deletes
+  attr_reader :uploads, :deletes, :tags
 
   def initialize(release:, assets:, tool_release:, tool_assets:)
     @release = release
@@ -28,9 +28,11 @@ class FakeSignClient
     @tool_assets = tool_assets
     @uploads = []
     @deletes = []
+    @tags = []
   end
 
-  def release_for_tag(_repo, _tag)
+  def release_for_tag(_repo, tag)
+    @tags << tag
     @release
   end
 
@@ -166,6 +168,12 @@ RSpec.describe TebakoRelease::Signer do
                                     "TEBAKO_VERSION" => version })
     expect { signer.sign_release }
       .to raise_error(TebakoRelease::Signer::SigningGateError, /TEBAKO_RELEASE_SIGNING_KEY secret is not set/)
+  end
+
+  it "targets TEBAKO_RELEASE_TAG when set (the line-shard override)" do
+    signer, client, = signer_for([], env: enabled_env.merge("TEBAKO_RELEASE_TAG" => "v#{version}-ruby9.9"))
+    signer.sign_release
+    expect(client.tags).to eq(["v#{version}-ruby9.9"])
   end
 
   it "fails named when the key secret is not valid base64 (the decode is real)" do

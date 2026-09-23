@@ -100,7 +100,10 @@ module TebakoRelease
       @client = client || Octokit::Client.new(access_token: ENV.fetch("GITHUB_TOKEN"), auto_paginate: true,
                                               connection_options: { request: CLIENT_CONNECTION_OPTIONS[:request].dup })
       @version = ENV.fetch("TEBAKO_VERSION")
-      @tag = "v#{@version}"
+      # The tag normally derives from the version; a line-shard
+      # republication (the 1,000-asset cap) decouples them — names stay
+      # version-branded, only the target tag moves.
+      @tag = ENV.fetch("TEBAKO_RELEASE_TAG", "v#{@version}")
       @release_title = "#{@config.title_prefix} #{@tag}"
       @contract_version = load_contract_version
     end
