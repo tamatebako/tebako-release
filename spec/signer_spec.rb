@@ -333,7 +333,12 @@ RSpec.describe TebakoRelease::Signer do
   it "names the detected host id when the tool asset is missing (no TEBAKO_PKG_HOST_ID)" do
     new = Time.utc(2026, 9, 9)
     env = enabled_env.except("TEBAKO_PKG_HOST_ID")
-    signer, = signer_for([asset(1, "pkg-a", new)], env: env)
+    # An EMPTY tool release: the detected host id varies with the spec
+    # host (the default fake carries only linux-gnu-x86_64, which a linux
+    # CI runner would find), so the missing-asset case must be host-free.
+    client = FakeSignClient.new(release: release, assets: [asset(1, "pkg-a", new)],
+                                tool_release: tool_release, tool_assets: [])
+    signer = TebakoRelease::Signer.new(client: client, executor: FakeSignExecutor.new, env: env)
     host_id = TebakoRelease::Platform.new.host_id
     expect { signer.sign_release }
       .to raise_error(TebakoRelease::Signer::SigningGateError, /no tebako-pkg #{Regexp.escape(host_id)} asset/)
