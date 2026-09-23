@@ -260,6 +260,24 @@ RSpec.describe TebakoRelease::Signer do
     )
   end
 
+  it "reads the leg's local bytes from SIGN_LOCAL_DIR when set" do
+    stub_const("TebakoRelease::Signer::CONVERGENCE_DELAYS", [0, 0, 0])
+    new = Time.utc(2026, 9, 9)
+    assets = [asset(1, "pkg-staged", new)]
+    env = enabled_env.merge("SIGN_LOCAL_DIR" => "out/flavor-triplet")
+    signer, _client, executor = signer_for(assets, env: env)
+    Dir.mktmpdir do |dir|
+      FileUtils.mkdir_p(File.join(dir, "out", "flavor-triplet"))
+      File.write(File.join(dir, "out", "flavor-triplet", "pkg-staged"), "BYTES-pkg-staged")
+      Dir.chdir(dir) { expect(signer.sign_release).to eq(:signed) }
+    end
+    expect(executor.sign_calls).to eq(["pkg-staged"])
+    # The staged bytes hashed to the listing's digest — no download.
+    expect(executor.download_patterns).to contain_exactly(
+      "tebako-pkg-2.5.0-linux-gnu-x86_64", "tebako-pkg-2.5.0-linux-gnu-x86_64.sha256"
+    )
+  end
+
   it "re-downloads when the local bytes disagree with the listing's digest" do
     stub_const("TebakoRelease::Signer::CONVERGENCE_DELAYS", [0, 0, 0])
     new = Time.utc(2026, 9, 9)

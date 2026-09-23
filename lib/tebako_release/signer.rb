@@ -72,7 +72,8 @@ module TebakoRelease
     # This run's fresh package bytes, materialized in the leg's workspace —
     # signing prefers them over a re-download, but only when they hash to
     # the release listing's digest (only a backfill onto an older release
-    # downloads).
+    # downloads). SIGN_LOCAL_DIR points a consumer whose legs stage bytes
+    # elsewhere (openjdk's out/<flavor>-<triplet>/) at this run's dir.
     LOCAL_PACKAGES_DIR = "runtime-packages"
 
     # upload convergence: a tiny metadata asset either lands or cycles;
@@ -172,6 +173,13 @@ module TebakoRelease
       (@env["SIGN_ONLY_STEMS"] || "").split(/[\s,]+/)
     end
 
+    # This run's fresh-bytes dir (the LOCAL_PACKAGES_DIR constant's
+    # rationale): SIGN_LOCAL_DIR overrides it for consumers whose legs
+    # stage their publish bytes outside runtime-packages/.
+    def local_packages_dir
+      @env["SIGN_LOCAL_DIR"] || LOCAL_PACKAGES_DIR
+    end
+
     # The platform this pass runs on — the signing tool's asset name flows
     # from it (TEBAKO_PKG_HOST_ID pins it in CI/specs; the Platform model
     # detects it otherwise).
@@ -245,7 +253,7 @@ module TebakoRelease
     # the release. The digest is the no-fold rule's provenance: the signed
     # bytes are provably the bytes the release serves.
     def sign_one(work, key_file, tool, release, name, digest) # rubocop:disable Metrics/AbcSize, Metrics/ParameterLists
-      local = Pathname.new(LOCAL_PACKAGES_DIR).join(name)
+      local = Pathname.new(local_packages_dir).join(name)
       target = if local.exist? && Digest::SHA256.file(local).hexdigest == digest
                  local
                else
