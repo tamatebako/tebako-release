@@ -1,0 +1,3 @@
+# The spec-time contract card: the release pipeline's SSOT for the
+# bootstrap <-> runtime contract version, fixture value.
+contract_version: 2
