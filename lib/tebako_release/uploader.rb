@@ -127,12 +127,17 @@ module TebakoRelease
     # key follows the same compat rule, and so does the windows runtime
     # DLL (<package>.dll) folded as `dll` with the PE name the store entry
     # materializes (`install_as`).
-    def build_manifest_entries(packages) # rubocop:disable Metrics/AbcSize
+    # Bundle-era (spec 36 §3, `bundles:` given): the entry KEEPS the
+    # per-member pins (exe sha256, the image/dll facet blocks — they pin
+    # the UNPACKED members the store verifies post-unpack) and gains the
+    # additive `bundle` block naming the one served payload asset.
+    def build_manifest_entries(packages, bundles: {}) # rubocop:disable Metrics/AbcSize
       executables, images, dlls = partition_packages(packages)
       executables.sort_by { |package| package.basename.to_s }.map do |package|
         image = images.find { |candidate| candidate.basename.to_s == image_name_for(package) }
         dll = dlls.find { |candidate| candidate.basename.to_s == dll_name_for(package) }
-        manifest_entry(package, image, dll)
+        bundle = bundles[package_stem(package.basename.to_s)] unless bundles.empty?
+        manifest_entry(package, image, dll, bundle: bundle)
       end
     end
 
@@ -432,15 +437,12 @@ module TebakoRelease
       nil
     end
 
-    def manifest_entry(package, image = nil, dll = nil) # rubocop:disable Metrics/AbcSize, Metrics/MethodLength
+    def manifest_entry(package, image = nil, dll = nil, bundle: nil) # rubocop:disable Metrics/AbcSize, Metrics/MethodLength
       runtime_version, platform = parse_package_filename(package.basename.to_s)
       contract = contract_sidecar(package)
       filename = package.basename.to_s
       sha256 = Digest::SHA256.file(package).hexdigest
-      # The idempotent upload skip reads these (same name + same sha = kept).
-      current_shas[filename] = sha256
-      current_shas[image_name_for(package)] = Digest::SHA256.file(image).hexdigest if image
-      current_shas[dll_name_for(package)] = Digest::SHA256.file(dll).hexdigest if dll
+      register_current_shas(package, image, dll, bundle)
       {
         tebako_version: @version,
         contract_era: contract.fetch("contract_era"),
@@ -466,12 +468,34 @@ module TebakoRelease
         entry[:capabilities] = @config.adapter.capabilities(version: runtime_version, platform_id: platform)
         entry[:image] = image_entry(image) if image
         entry[:dll] = dll_entry(dll, runtime_version, platform) if dll
+        entry[:bundle] = bundle_entry(bundle) if bundle
         declare_signatures(entry)
       end
     end
 
+    # The additive bundle metadata (spec 36 §3): the ONE served payload
+    # asset of a bundle-era leg. The entry's exe/image/dll pins stay —
+    # they pin the unpacked members; this block names what the release
+    # actually serves.
+    def bundle_entry(bundle)
+      {
+        filename: bundle.basename.to_s,
+        sha256: Digest::SHA256.file(bundle).hexdigest,
+        size_bytes: bundle.size
+      }
+    end
+
+    # The idempotent upload skip reads these (same name + same sha = kept):
+    # the exe, its facets, and the bundle (spec 36's bundle-era asset).
+    def register_current_shas(package, image, dll, bundle) # rubocop:disable Metrics/AbcSize
+      current_shas[package.basename.to_s] = Digest::SHA256.file(package).hexdigest
+      current_shas[image_name_for(package)] = Digest::SHA256.file(image).hexdigest if image
+      current_shas[dll_name_for(package)] = Digest::SHA256.file(dll).hexdigest if dll
+      current_shas[bundle.basename.to_s] = Digest::SHA256.file(bundle).hexdigest if bundle
+    end
+
     # Spec 13 §2a / spec 09 §5: on signing-enabled lines every artifact the
-    # entry names declares its own `signature` block — {keyid, asc}: the
+    # entry SERVES declares its own `signature` block — {keyid, asc}: the
     # signer's 16-lowercase-hex PRIMARY keyid (spec 09 §9) and the exact
     # `.asc` asset name within this release, declared by the factory and
     # flowed verbatim by consumers (never synthesized — the same SSOT rule
@@ -481,11 +505,21 @@ module TebakoRelease
       return unless signing_enabled?
 
       keyid = signing_keyid
+      return declare_bundle_signature(entry, keyid) if entry[:bundle]
+
       entry[:signature] = { keyid: keyid, asc: "#{entry[:filename]}.asc" }
       %i[image dll].each do |facet|
         block = entry[facet]
         block[:signature] = { keyid: keyid, asc: "#{block[:filename]}.asc" } if block
       end
+    end
+
+    # Bundle-era (spec 36 §3): the only served payload is the bundle —
+    # three signatures per leg (bundle, its sidecar, the shard). The
+    # exe/image/dll member pins are NOT served assets; declaring their
+    # .asc would be an invalid signing state (spec 09 §4).
+    def declare_bundle_signature(entry, keyid)
+      entry[:bundle][:signature] = { keyid: keyid, asc: "#{entry[:bundle][:filename]}.asc" }
     end
 
     # The signing arm (spec 09 §5's house style): TEBAKO_RELEASE_SIGNING_ENABLED=true
@@ -743,15 +777,71 @@ module TebakoRelease
 
       packages = validate_packages_directory
       report_missing_packages(packages)
-      # Entries BEFORE uploads: the sha256s they compute feed the idempotent
-      # upload skip (same name + same sha = no re-upload). This leg's
-      # entries only — nothing merges.
-      entries = build_manifest_entries(packages)
-      publish_release(release, packages, entries)
+      process_era_release(release, packages)
       # The leg signs AFTER its own publish (the .asc assets land in the
       # same leg — spec 13 §2a), so the publish-time gate cannot require
       # them; the coordinator's release-job audit does.
       verify_completeness(release)
+    end
+
+    # The era branch (spec 36): the bundle shape publishes each package's
+    # ONE bundle then its metadata; the per-file shape publishes the
+    # enumeration. Entries are built BEFORE uploads either way — the
+    # sha256s they compute feed the idempotent upload skip (same name +
+    # same sha = no re-upload). This leg's entries only — nothing merges.
+    def process_era_release(release, packages)
+      return process_bundle_release(release, packages) if bundle_publish?
+
+      entries = build_manifest_entries(packages)
+      publish_release(release, packages, entries)
+    end
+
+    # Spec 36's publish shape: build each package's bundle FIRST (its sha
+    # feeds the entry's bundle block and the idempotent skip), upload the
+    # bundles as the legs' only payload assets, then the metadata (shard
+    # with the bundle block + the bundle's sidecar). The member files
+    # themselves never become release assets — the bundle is the unit.
+    def process_bundle_release(release, packages)
+      bundles = build_bundles(packages)
+      entries = build_manifest_entries(packages, bundles: bundles)
+      bundles.each_value { |bundle| upload_package(release, bundle) }
+      entries.each { |entry| ensure_package_metadata(release, entry) }
+      print_settled_summary
+    end
+
+    # One bundle per executable, built into a dot-subdir of runtime-packages
+    # (the packages glob never descends into it — a bundle is never mistaken
+    # for a staged package on a later validation). Keyed by package stem.
+    def build_bundles(packages)
+      executables, images, dlls = partition_packages(packages)
+      dir = Pathname.new("runtime-packages/.bundles").tap(&:mkpath)
+      executables.sort_by { |package| package.basename.to_s }.to_h do |package|
+        [package_stem(package.basename.to_s), build_bundle(dir, package, images, dlls)]
+      end
+    end
+
+    # One package's bundle.
+    def build_bundle(dir, package, images, dlls)
+      dll = dlls.find { |candidate| candidate.basename.to_s == dll_name_for(package) }
+      Bundler.new.build(dir, package_stem(package.basename.to_s),
+                        exe: package, image: bundle_image!(package, images), dlls: Array(dll))
+    end
+
+    # A bundle without its env image is not a runtime (spec 36 §2): the
+    # per-file shape tolerates the gap so the completeness gate can name it
+    # at the end; the bundle cannot — fail here naming it.
+    def bundle_image!(package, images)
+      image = images.find { |candidate| candidate.basename.to_s == image_name_for(package) }
+      return image if image
+
+      raise Error, "runtime package #{package.basename} has no env image (#{image_name_for(package)}) — " \
+                   "a bundle cannot ship without it (spec 36 §2)"
+    end
+
+    # Spec 36's era gate, factory-declared through the adapter (never an
+    # env knob — the publish shape is the factory's policy, spec 00 §10).
+    def bundle_publish?
+      @config.adapter.bundle_publish?
     end
 
     # AUDIT_ONLY (the coordinator's release job / a publish dry run):
@@ -794,12 +884,22 @@ module TebakoRelease
       end
     end
 
-    # The asset name -> sha256 pairs a package's metadata covers: the exe,
-    # its .tfs image and its .dll facet.
+    # The asset name -> sha256 pairs a package's metadata covers. Per-file
+    # era: the exe, its .tfs image and its .dll facet. Bundle era (spec 36
+    # §3): the bundle is the ONE served payload asset — the entry's
+    # exe/image/dll fields are member pins, not served names, so they earn
+    # no sidecar.
     def metadata_assets(entry)
+      return { entry[:bundle][:filename] => entry[:bundle][:sha256] } if entry[:bundle]
+
       { entry[:filename] => entry[:sha256] }
-        .merge(entry[:image] ? { entry[:image][:filename] => entry[:image][:sha256] } : {})
-        .merge(entry[:dll] ? { entry[:dll][:filename] => entry[:dll][:sha256] } : {})
+        .merge(facet_metadata(entry, :image))
+        .merge(facet_metadata(entry, :dll))
+    end
+
+    def facet_metadata(entry, facet)
+      block = entry[facet]
+      block ? { block[:filename] => block[:sha256] } : {}
     end
 
     def shard_name_for(entry)
@@ -1004,12 +1104,24 @@ module TebakoRelease
     # landed — a package whose exe never landed reports its own name only,
     # never a cascade of secondary sidecar/shard gaps (one error per gap).
     def missing_package_assets(present, name, require_signatures: false)
+      return missing_bundle_assets(present, name, require_signatures: require_signatures) if bundle_publish?
+
       exe = [name, "#{name}.exe"].find { |candidate| present.include?(candidate) }
       landed, missing = expected_facets(name).partition { |facet| present.include?(facet) }
       missing.unshift(name) unless exe
       return missing if exe.nil?
 
       missing + missing_metadata(present, name, [exe] + landed, require_signatures: require_signatures)
+    end
+
+    # Spec 36's completeness shape: the bundle is the leg's ONE payload
+    # asset; a landed bundle owes its sidecar and the package's shard
+    # (plus an .asc of each on signing-enabled audits).
+    def missing_bundle_assets(present, name, require_signatures: false)
+      bundle = "#{name}#{Bundler::BUNDLE_SUFFIX}"
+      return [bundle] unless present.include?(bundle)
+
+      missing_metadata(present, name, [bundle], require_signatures: require_signatures)
     end
 
     # The non-executable artifacts a package is expected to carry: the
@@ -1336,11 +1448,12 @@ module TebakoRelease
     end
 
     # The package stem an asset name belongs to: the exe (with or without
-    # .exe), its .tfs image and its .dll facet share one stem — settling is
-    # package-scoped so a wedged exe also stands down its facets (a fresh
-    # facet over previous package bytes would be a mixed-version package).
+    # .exe), its .tfs image, its .dll facet and its .tar.gz bundle (spec 36)
+    # share one stem — settling is package-scoped so a wedged exe also
+    # stands down its facets (a fresh facet over previous package bytes
+    # would be a mixed-version package).
     def package_stem(filename)
-      filename.sub(/\.(exe|tfs|dll)\z/, "")
+      filename.sub(/\.tar\.gz\z/, "").sub(/\.(exe|tfs|dll)\z/, "")
     end
 
     def settled?(filename)
@@ -1473,12 +1586,15 @@ module TebakoRelease
 
     # The sha256 the previous manifest records for this asset: the entry's
     # own sha for the executable, the image/dll facet block's sha for a
-    # facet (facets key under their package's entry).
+    # facet (facets key under their package's entry), the bundle block's
+    # sha for the bundle (spec 36 — the bundle-era served asset).
     def previous_sha_for(entry, filename)
       if entry.dig(:image, :filename) == filename
         entry.dig(:image, :sha256)
       elsif entry.dig(:dll, :filename) == filename
         entry.dig(:dll, :sha256)
+      elsif entry.dig(:bundle, :filename) == filename
+        entry.dig(:bundle, :sha256)
       else
         entry[:sha256]
       end

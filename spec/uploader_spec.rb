@@ -1884,4 +1884,153 @@ RSpec.describe TebakoRelease::Uploader do
       end
     end
   end
+
+  # Spec 36's bundle-era publish shape (the factory opts in through the
+  # adapter): ONE bundle per leg + its sidecar + the shard — never the
+  # per-file enumeration.
+  describe "bundle-era publish (spec 36)" do
+    let(:store) { FakeAssetStore.new }
+    let(:client) { FakeClient.new(store) }
+    let(:bundle_config) do
+      TebakoRelease::Config.new(repo: "tamatebako/tebako-runtime-ruby", language: "ruby",
+                                title_prefix: "Tebako runtime packages",
+                                contract_yml: File.join(REPO_ROOT, "spec", "fixtures", "contract.yml"),
+                                adapter: BundleSpecAdapter.new)
+    end
+    let(:fake_manager) { described_class.new(client: client, config: bundle_config) }
+
+    before { allow(fake_manager).to receive(:sleep) }
+
+    def stage_packages(*names)
+      dir = @dir.join("runtime-packages")
+      dir.mkdir
+      names.each do |name|
+        path = dir.join(name)
+        path.write("bytes-of-#{name}")
+        write_contract_sidecar(path) unless name.end_with?(".tfs", ".dll")
+      end
+    end
+
+    def read_bundle_bytes(bytes)
+      members = []
+      Zlib::GzipReader.wrap(StringIO.new(bytes)) do |gz|
+        Gem::Package::TarReader.new(gz) do |tar|
+          tar.each { |entry| members << [entry.full_name, entry.read] }
+        end
+      end
+      members
+    end
+
+    it "is off by default — a factory opts in deliberately" do
+      expect(TebakoRelease::Adapter.new.bundle_publish?).to be(false)
+    end
+
+    it "publishes the bundle, its sidecar and the shard — never the member files" do
+      stage_packages("tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64",
+                     "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64.tfs")
+
+      with_packages { fake_manager.process_release }
+
+      stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
+      expect(store.uploads).to contain_exactly("#{stem}.tar.gz", "#{stem}.tar.gz.sha256", "#{stem}.manifest.json")
+
+      bundle_bytes = store.content_for("https://download.test/#{stem}.tar.gz")
+      members = read_bundle_bytes(bundle_bytes)
+      expect(members.map(&:first)).to eq([stem, "#{stem}.tfs", "SHA256SUMS"])
+      expect(members[0][1]).to eq("bytes-of-#{stem}")
+      expect(members[1][1]).to eq("bytes-of-#{stem}.tfs")
+
+      shard = JSON.parse(store.content_for("https://download.test/#{stem}.manifest.json"))
+      expect(shard["filename"]).to eq(stem)
+      expect(shard["sha256"]).to eq(Digest::SHA256.hexdigest("bytes-of-#{stem}"))
+      expect(shard["image"]["sha256"]).to eq(Digest::SHA256.hexdigest("bytes-of-#{stem}.tfs"))
+      expect(shard["bundle"]).to eq(
+        "filename" => "#{stem}.tar.gz",
+        "sha256" => Digest::SHA256.hexdigest(bundle_bytes),
+        "size_bytes" => bundle_bytes.bytesize
+      )
+      expect(store.content_for("https://download.test/#{stem}.tar.gz.sha256"))
+        .to eq("#{Digest::SHA256.hexdigest(bundle_bytes)}  #{stem}.tar.gz\n")
+    end
+
+    it "packs the windows DLL into the bundle and keeps its member pin in the shard" do
+      ENV["EXPECTED_ENV_MATRIX"] = '[{"host":"windows-2022","container":null,"os":"windows","arch":"x86_64"}]'
+      stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-windows-ucrt64"
+      stage_packages("#{stem}.exe", "#{stem}.tfs", "#{stem}.dll")
+
+      with_packages { fake_manager.process_release }
+
+      expect(store.uploads).to contain_exactly("#{stem}.tar.gz", "#{stem}.tar.gz.sha256", "#{stem}.manifest.json")
+      members = read_bundle_bytes(store.content_for("https://download.test/#{stem}.tar.gz"))
+      expect(members.map(&:first)).to eq(["#{stem}.exe", "#{stem}.tfs", "#{stem}.dll", "SHA256SUMS"])
+      shard = JSON.parse(store.content_for("https://download.test/#{stem}.manifest.json"))
+      expect(shard["filename"]).to eq("#{stem}.exe")
+      expect(shard["dll"]["sha256"]).to eq(Digest::SHA256.hexdigest("bytes-of-#{stem}.dll"))
+      expect(shard["bundle"]["filename"]).to eq("#{stem}.tar.gz")
+    end
+
+    it "fails named when a package has no env image — a bundle cannot ship without it" do
+      stage_packages("tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64")
+
+      with_packages do
+        expect { fake_manager.process_release }
+          .to raise_error(TebakoRelease::Error, /has no env image .* a bundle cannot ship without it/)
+      end
+    end
+
+    it "fails the publish when an expected bundle never lands" do
+      stage_packages("tebako-runtime-#{SPEC_VERSION}-3.1.6-linux-gnu-x86_64",
+                     "tebako-runtime-#{SPEC_VERSION}-3.1.6-linux-gnu-x86_64.tfs")
+
+      with_packages do
+        expect { fake_manager.process_release }
+          .to raise_error(/incomplete \(1 missing/)
+          .and output(/::error::Missing asset: tebako-runtime-#{SPEC_VERSION}-3\.3\.7-macos-arm64\.tar\.gz/).to_stdout
+      end
+    end
+
+    it "declares the signature on the bundle block only when armed (three signatures per leg)" do
+      ENV["TEBAKO_RELEASE_SIGNING_ENABLED"] = "true"
+      ENV["TEBAKO_RELEASE_SIGNING_KEYID"] = "efc3c250f7862a48"
+      stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
+      stage_packages(stem, "#{stem}.tfs")
+
+      with_packages { fake_manager.process_release }
+
+      shard = JSON.parse(store.content_for("https://download.test/#{stem}.manifest.json"))
+      expect(shard["bundle"]["signature"])
+        .to eq("keyid" => "efc3c250f7862a48", "asc" => "#{stem}.tar.gz.asc")
+      expect(shard).not_to have_key("signature")
+      expect(shard["image"]).not_to have_key("signature")
+    end
+
+    it "audit mode passes on the bundle-era asset set (bundle + sidecar + shard)" do
+      ENV["AUDIT_ONLY"] = "true"
+      stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
+      store.assets << FakeAsset.new(7, "#{stem}.tar.gz", "https://download.test/#{stem}.tar.gz")
+      store.assets << FakeAsset.new(8, "#{stem}.tar.gz.sha256", "https://download.test/#{stem}.tar.gz.sha256")
+      store.assets << FakeAsset.new(9, "#{stem}.manifest.json", "https://download.test/#{stem}.manifest.json")
+
+      with_packages do
+        expect { fake_manager.process_release }.to output(/AUDIT mode/).to_stdout
+      end
+      expect(store.uploads).to be_empty
+    end
+
+    it "signing-enabled audit requires the three .asc assets" do
+      ENV["AUDIT_ONLY"] = "true"
+      ENV["TEBAKO_RELEASE_SIGNING_ENABLED"] = "true"
+      ENV["TEBAKO_RELEASE_SIGNING_KEYID"] = "efc3c250f7862a48"
+      stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
+      store.assets << FakeAsset.new(7, "#{stem}.tar.gz", "https://download.test/#{stem}.tar.gz")
+      store.assets << FakeAsset.new(8, "#{stem}.tar.gz.sha256", "https://download.test/#{stem}.tar.gz.sha256")
+      store.assets << FakeAsset.new(9, "#{stem}.manifest.json", "https://download.test/#{stem}.manifest.json")
+
+      with_packages do
+        expect { fake_manager.process_release }
+          .to raise_error(/incomplete \(3 missing/)
+          .and output(/Missing asset: #{Regexp.escape("#{stem}.tar.gz.asc")}/).to_stdout
+      end
+    end
+  end
 end

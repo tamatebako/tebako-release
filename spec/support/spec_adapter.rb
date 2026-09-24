@@ -33,3 +33,11 @@ class SpecAdapter < TebakoRelease::Adapter
     "x64-ucrt-ruby#{(major * 100) + (minor * 10)}.dll"
   end
 end
+
+# The spec 36 opt-in: a factory adapter declaring the bundle-era publish
+# shape (the bundle suites' stand-in for the factory's deliberate opt-in).
+class BundleSpecAdapter < SpecAdapter
+  def bundle_publish?
+    true
+  end
+end
