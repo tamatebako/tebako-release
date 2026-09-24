@@ -13,7 +13,7 @@ Gem::Specification.new do |spec|
                      "the de-rendezvoused per-leg uploader (shards + sidecars, byte-immutable keeps, " \
                      "convergence and rate-limit ride-outs) and the no-fold OpenPGP release signer. " \
                      "Factories consume the gem; they never carry copies of the machinery."
-  spec.homepage = "https://github.com/tamatebako/tebako-release-tooling"
+  spec.homepage = "https://github.com/tamatebako/tebako-release"
   spec.license = "BSD-2-Clause"
   spec.required_ruby_version = ">= 3.3"
 

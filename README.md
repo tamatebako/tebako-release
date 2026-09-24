@@ -1,4 +1,4 @@
-# tebako-release-tooling
+# tebako-release
 
 The tebako factories' release machinery — the **single owner** of the per-leg
 publish uploader and the no-fold OpenPGP release signer that every runtime
@@ -35,7 +35,7 @@ A factory adds the gem, pinned through its `contract.yml` SSOT:
 ```ruby
 # Gemfile
 gem "tebako-release",
-    git: "https://github.com/tamatebako/tebako-release-tooling.git",
+    git: "https://github.com/tamatebako/tebako-release.git",
     tag: YAML.load_file("contract.yml").fetch("release_tooling")
 ```
 
