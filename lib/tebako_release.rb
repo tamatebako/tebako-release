@@ -9,6 +9,7 @@ require_relative "tebako_release/error"
 require_relative "tebako_release/adapter"
 require_relative "tebako_release/config"
 require_relative "tebako_release/platform"
+require_relative "tebako_release/bundler"
 require_relative "tebako_release/uploader"
 require_relative "tebako_release/signer"
 

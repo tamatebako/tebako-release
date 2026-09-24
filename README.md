@@ -18,6 +18,12 @@ through a small adapter file and pin this gem — they never carry copies.
   signing: every served name gets its own detached `.asc`, provenance-checked
   against the release listing's digest, with the young-release-object
   served-bytes convergence.
+- **`TebakoRelease::Bundler`** — spec 36's deterministic bundle builder:
+  one `<stem>.tar.gz` per leg (exe + env image + support DLLs + a closing
+  in-bundle SHA256SUMS; fixed member order, mtime=0 — identical inputs
+  yield identical bytes). A factory opts into the bundle-era publish shape
+  through its adapter (`bundle_publish? → true`); the per-file shape stays
+  the default for pre-bundle lines.
 - **`TebakoRelease::Platform`** — the release-side platform vocabulary
   (the `(os, arch) → host_id` table; mirrors `tpkg::Platform`, drift fails
   loudly in factory CI).

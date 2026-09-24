@@ -46,5 +46,14 @@ module TebakoRelease
     def version_grammar_source
       "\\d+\\.\\d+\\.\\d+"
     end
+
+    # Spec 36's publish shape: when true, each leg publishes ONE bundle
+    # (<stem>.tar.gz — exe + env image + DLLs + in-bundle SHA256SUMS) plus
+    # its sidecar and shard, instead of the per-file asset enumeration.
+    # Default off: a factory opts in deliberately, with the bundle-era
+    # resolver shipped downstream (spec 36 §4's compat window).
+    def bundle_publish?
+      false
+    end
   end
 end
