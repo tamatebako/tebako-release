@@ -442,7 +442,8 @@ module TebakoRelease
       contract = contract_sidecar(package)
       filename = package.basename.to_s
       sha256 = Digest::SHA256.file(package).hexdigest
-      register_current_shas(package, image, dll, bundle)
+      blksum = derive_blksum(image) if image
+      register_current_shas(package, image, dll, bundle, blksum)
       {
         tebako_version: @version,
         contract_era: contract.fetch("contract_era"),
@@ -466,7 +467,7 @@ module TebakoRelease
         # selector axis. Sourced from the factory's adapter (the same truth
         # its boot smoke asserts), so manifest and smoke can never disagree.
         entry[:capabilities] = @config.adapter.capabilities(version: runtime_version, platform_id: platform)
-        entry[:image] = image_entry(image) if image
+        entry[:image] = image_entry(image, blksum) if image
         entry[:dll] = dll_entry(dll, runtime_version, platform) if dll
         entry[:bundle] = bundle_entry(bundle) if bundle
         declare_signatures(entry)
@@ -486,12 +487,36 @@ module TebakoRelease
     end
 
     # The idempotent upload skip reads these (same name + same sha = kept):
-    # the exe, its facets, and the bundle (spec 36's bundle-era asset).
-    def register_current_shas(package, image, dll, bundle) # rubocop:disable Metrics/AbcSize
+    # the exe, its facets, the derived blksum sidecar (spec 39 §3), and the
+    # bundle (spec 36's bundle-era asset).
+    def register_current_shas(package, image, dll, bundle, blksum = nil) # rubocop:disable Metrics/AbcSize
       current_shas[package.basename.to_s] = Digest::SHA256.file(package).hexdigest
       current_shas[image_name_for(package)] = Digest::SHA256.file(image).hexdigest if image
       current_shas[dll_name_for(package)] = Digest::SHA256.file(dll).hexdigest if dll
       current_shas[bundle.basename.to_s] = Digest::SHA256.file(bundle).hexdigest if bundle
+      current_shas[Blksum.sidecar_name(image)] = blksum.digest if blksum
+    end
+
+    # The spec 39 §3 derivation: the publisher authors the block-group
+    # digest sidecar in-process from the staged image bytes (a pure
+    # function of them — the same derivable-metadata class as the .sha256
+    # sidecars), stages it BESIDE the image so the leg's attestation glob
+    # (runtime-packages/*) covers it, and the entry's `image.blksum` block
+    # pins the document's own sha256. support_file? keeps a staged sidecar
+    # from classifying as a package on a re-run validation.
+    def derive_blksum(image)
+      blksum = Blksum.for_image(image)
+      path = Pathname.new("#{image}#{Blksum::SIDECAR_SUFFIX}")
+      path.write(blksum.render)
+      staged_blksums[path.basename.to_s] = path
+      blksum
+    end
+
+    # The derived sidecar paths this invocation staged, keyed by asset
+    # name — the upload leg's source (entries are built before uploads in
+    # every publish shape, so a declared sidecar is always staged).
+    def staged_blksums
+      @staged_blksums ||= {}
     end
 
     # Spec 13 §2a / spec 09 §5: on signing-enabled lines every artifact the
@@ -573,12 +598,19 @@ module TebakoRelease
     end
 
     # The additive image metadata: name, sha256, size (consumers ignoring the
-    # `image` key keep working; item 30's compat rule).
-    def image_entry(image)
+    # `image` key keep working; item 30's compat rule) — plus the additive
+    # `blksum` pin (spec 39 §3: {filename, sha256} of the derived block-group
+    # digest sidecar; consumers that predate the key ignore it, and the
+    # loader's lazy arm falls back to eager loudly when it is absent).
+    def image_entry(image, blksum)
       {
         filename: image.basename.to_s,
         sha256: Digest::SHA256.file(image).hexdigest,
-        size_bytes: image.size
+        size_bytes: image.size,
+        blksum: {
+          filename: Blksum.sidecar_name(image),
+          sha256: blksum.digest
+        }
       }
     end
 
@@ -805,6 +837,7 @@ module TebakoRelease
       bundles = build_bundles(packages)
       entries = build_manifest_entries(packages, bundles: bundles)
       bundles.each_value { |bundle| upload_package(release, bundle) }
+      upload_blksum_sidecars(release, entries)
       entries.each { |entry| ensure_package_metadata(release, entry) }
       print_settled_summary
     end
@@ -867,8 +900,30 @@ module TebakoRelease
     # the release notes are written once at creation.
     def publish_release(release, packages, entries)
       packages.each { |package| upload_package(release, package) }
+      upload_blksum_sidecars(release, entries)
       entries.each { |entry| ensure_package_metadata(release, entry) }
       print_settled_summary
+    end
+
+    # The spec 39 §3 sidecars ride along in BOTH publish eras as STANDALONE
+    # assets — never bundle members: the lazy resolver fetches the sidecar
+    # with a plain GET against its own release-asset URL
+    # (`{dir_url}/{image.blksum.filename}`), in the bundle era too. Derived
+    # at entry-build time and staged beside the images; uploaded before the
+    # metadata so the shard that pins them never precedes them.
+    def upload_blksum_sidecars(release, entries)
+      entries.each do |entry|
+        name = entry.dig(:image, :blksum, :filename)
+        next unless name
+
+        path = staged_blksums[name]
+        unless path
+          raise Error, "the blksum sidecar #{name} was declared but never staged — " \
+                       "the derivation runs at entry-build time; this is a machinery bug"
+        end
+
+        upload_package(release, path)
+      end
     end
 
     # The package's metadata assets, byte-truthful for the SERVED bytes: a
@@ -888,17 +943,30 @@ module TebakoRelease
     # era: the exe, its .tfs image and its .dll facet. Bundle era (spec 36
     # §3): the bundle is the ONE served payload asset — the entry's
     # exe/image/dll fields are member pins, not served names, so they earn
-    # no sidecar.
+    # no sidecar. Both eras: the derived blksum sidecar (spec 39 §3) IS a
+    # served standalone asset, so it earns its own .sha256 sidecar like
+    # every served name.
     def metadata_assets(entry)
-      return { entry[:bundle][:filename] => entry[:bundle][:sha256] } if entry[:bundle]
-
-      { entry[:filename] => entry[:sha256] }
-        .merge(facet_metadata(entry, :image))
-        .merge(facet_metadata(entry, :dll))
+      served = if entry[:bundle]
+                 { entry[:bundle][:filename] => entry[:bundle][:sha256] }
+               else
+                 { entry[:filename] => entry[:sha256] }
+                   .merge(facet_metadata(entry, :image))
+                   .merge(facet_metadata(entry, :dll))
+               end
+      served.merge(blksum_metadata(entry))
     end
 
     def facet_metadata(entry, facet)
       block = entry[facet]
+      block ? { block[:filename] => block[:sha256] } : {}
+    end
+
+    # The blksum sidecar's name -> sha256 pair when the entry declares it
+    # (spec 39 §3's `image.blksum` pin); a pre-blksum previous entry
+    # declares nothing and earns nothing (byte-truthful metadata).
+    def blksum_metadata(entry)
+      block = entry.dig(:image, :blksum)
       block ? { block[:filename] => block[:sha256] } : {}
     end
 
@@ -910,7 +978,8 @@ module TebakoRelease
     # with the previous entry's voice; a never-published settle has nothing
     # truthful to keep and never reaches here (upload_package re-raised).
     def effective_entry(entry)
-      names = [entry[:filename], entry.dig(:image, :filename), entry.dig(:dll, :filename)].compact
+      names = [entry[:filename], entry.dig(:image, :filename), entry.dig(:dll, :filename),
+               entry.dig(:image, :blksum, :filename)].compact
       return entry unless names.any? { |name| settled?(name) }
 
       previous_entry_for(entry[:filename]) || entry
@@ -1095,7 +1164,9 @@ module TebakoRelease
 
     def missing_assets(release, packages, require_signatures: false)
       present = all_assets(release).map(&:name)
-      packages.flat_map { |name| missing_package_assets(present, name, require_signatures: require_signatures) }
+      packages.flat_map do |name|
+        missing_package_assets(release, present, name, require_signatures: require_signatures)
+      end
     end
 
     # One expected package's gaps. Windows executables may or may not carry
@@ -1103,11 +1174,16 @@ module TebakoRelease
     # expectation matches both. Metadata expectations ride on what actually
     # landed — a package whose exe never landed reports its own name only,
     # never a cascade of secondary sidecar/shard gaps (one error per gap).
-    def missing_package_assets(present, name, require_signatures: false)
-      return missing_bundle_assets(present, name, require_signatures: require_signatures) if bundle_publish?
+    # The blksum sidecar (spec 39 §3) is expected ONLY when the package's
+    # shard declares the `image.blksum` pin — a pre-blksum release's audit
+    # stays green (the additive-key compat rule), and a missing shard
+    # reports its own gap only.
+    def missing_package_assets(release, present, name, require_signatures: false)
+      return missing_bundle_assets(release, present, name, require_signatures: require_signatures) if bundle_publish?
 
       exe = [name, "#{name}.exe"].find { |candidate| present.include?(candidate) }
       landed, missing = expected_facets(name).partition { |facet| present.include?(facet) }
+      landed, missing = split_blksum_expectation(release, present, name, landed, missing)
       missing.unshift(name) unless exe
       return missing if exe.nil?
 
@@ -1116,12 +1192,49 @@ module TebakoRelease
 
     # Spec 36's completeness shape: the bundle is the leg's ONE payload
     # asset; a landed bundle owes its sidecar and the package's shard
-    # (plus an .asc of each on signing-enabled audits).
-    def missing_bundle_assets(present, name, require_signatures: false)
+    # (plus an .asc of each on signing-enabled audits). The declared
+    # blksum sidecar (spec 39 §3) is a standalone served asset in this
+    # era too — expected, with its own metadata, when the shard pins it.
+    def missing_bundle_assets(release, present, name, require_signatures: false)
       bundle = "#{name}#{Bundler::BUNDLE_SUFFIX}"
       return [bundle] unless present.include?(bundle)
 
-      missing_metadata(present, name, [bundle], require_signatures: require_signatures)
+      landed, missing = split_blksum_expectation(release, present, name, [bundle], [])
+      missing + missing_metadata(present, name, landed, require_signatures: require_signatures)
+    end
+
+    # The shard-declared blksum expectation (spec 39 §3): the shard is the
+    # declaration's only authority (the additive `image.blksum` key), so
+    # the audit reads it. A shard that declares no pin expects nothing (a
+    # pre-blksum release audits green); a shard that never landed already
+    # reports its own gap, so it adds no secondary blksum gaps; an
+    # unreadable shard warns and expects nothing (never a silent failure —
+    # the shard's own gap is the gate's business). A DECLARED sidecar that
+    # never landed reports its own name only — its sidecar/.asc cascade
+    # rides the landed set, one error per gap.
+    def split_blksum_expectation(release, present, name, landed, missing)
+      declared = declared_blksum_name(release, present, name)
+      return [landed, missing] unless declared
+
+      if present.include?(declared)
+        [landed + [declared], missing]
+      else
+        [landed, missing + [declared]]
+      end
+    end
+
+    # The sidecar name the package's shard declares (`image.blksum`),
+    # nil when undeclared, when the shard never landed, or when it cannot
+    # be read (loudly — the audit never guesses an expectation).
+    def declared_blksum_name(release, present, name)
+      shard = "#{name}#{SHARD_SUFFIX}"
+      return nil unless present.include?(shard)
+
+      download_asset_json(find_asset(release, shard)).dig("image", "blksum", "filename")
+    rescue StandardError => e
+      puts "::warning::could not read #{shard} for the blksum expectation (#{e.class}: #{e.message}) — " \
+           "no blksum sidecar is expected of this package"
+      nil
     end
 
     # The non-executable artifacts a package is expected to carry: the
@@ -1448,12 +1561,13 @@ module TebakoRelease
     end
 
     # The package stem an asset name belongs to: the exe (with or without
-    # .exe), its .tfs image, its .dll facet and its .tar.gz bundle (spec 36)
-    # share one stem — settling is package-scoped so a wedged exe also
-    # stands down its facets (a fresh facet over previous package bytes
-    # would be a mixed-version package).
+    # .exe), its .tfs image, its .dll facet, the derived blksum sidecar
+    # (spec 39 §3) and its .tar.gz bundle (spec 36) share one stem —
+    # settling is package-scoped so a wedged exe also stands down its
+    # facets (a fresh facet over previous package bytes would be a
+    # mixed-version package). Longest suffix first.
     def package_stem(filename)
-      filename.sub(/\.tar\.gz\z/, "").sub(/\.(exe|tfs|dll)\z/, "")
+      filename.sub(/\.tar\.gz\z/, "").sub(/\.tfs\.blksum\.json\z/, "").sub(/\.(exe|tfs|dll)\z/, "")
     end
 
     def settled?(filename)
@@ -1586,18 +1700,13 @@ module TebakoRelease
 
     # The sha256 the previous manifest records for this asset: the entry's
     # own sha for the executable, the image/dll facet block's sha for a
-    # facet (facets key under their package's entry), the bundle block's
-    # sha for the bundle (spec 36 — the bundle-era served asset).
+    # facet (facets key under their package's entry), the image's blksum
+    # pin for the derived sidecar (spec 39 §3), the bundle block's sha for
+    # the bundle (spec 36 — the bundle-era served asset).
     def previous_sha_for(entry, filename)
-      if entry.dig(:image, :filename) == filename
-        entry.dig(:image, :sha256)
-      elsif entry.dig(:dll, :filename) == filename
-        entry.dig(:dll, :sha256)
-      elsif entry.dig(:bundle, :filename) == filename
-        entry.dig(:bundle, :sha256)
-      else
-        entry[:sha256]
-      end
+      blocks = [entry.dig(:image, :blksum), entry[:image], entry[:dll], entry[:bundle]]
+      block = blocks.find { |candidate| candidate && candidate[:filename] == filename }
+      block ? block[:sha256] : entry[:sha256]
     end
 
     def validate_environment
@@ -1624,13 +1733,16 @@ module TebakoRelease
     end
 
     # `.abi` sidecars (the runtime's platform string), `.contract.yaml`
-    # sidecars (the era-2 release card provenance) and `.sha256` markers
+    # sidecars (the era-2 release card provenance), `.sha256` markers
     # (the image's store-layout trust anchor, spec 22 §6 — the boot
-    # smoke's image-key input) are manifest inputs / build outputs read
-    # in place — never packages of their own.
+    # smoke's image-key input) and `.blksum.json` sidecars (the spec 39 §3
+    # derivation staged beside its image at entry-build time — still in
+    # the directory when a re-run validates) are manifest inputs / build
+    # outputs read in place — never packages of their own.
     def support_file?(path)
       path.extname == ".abi" || path.extname == ".sha256" ||
-        path.basename.to_s.end_with?(CONTRACT_SIDECAR_SUFFIX)
+        path.basename.to_s.end_with?(CONTRACT_SIDECAR_SUFFIX) ||
+        Blksum.blksum_file?(path)
     end
   end
 end

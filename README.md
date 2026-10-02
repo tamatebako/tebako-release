@@ -24,6 +24,14 @@ through a small adapter file and pin this gem — they never carry copies.
   yield identical bytes). A factory opts into the bundle-era publish shape
   through its adapter (`bundle_publish? → true`); the per-file shape stays
   the default for pre-bundle lines.
+- **`TebakoRelease::Blksum`** — the spec 39 §3 block-group digest sidecar
+  (`<image>.blksum.json`: one sha256 per 4 MiB group of env-image bytes,
+  the lazy mount's range-GET trust anchor). The uploader derives it
+  in-process from the staged image at entry-build time — a pure function
+  of the served bytes, the same class as the `.sha256` sidecars — pins it
+  in the shard (`image.blksum {filename, sha256}`), and uploads it as a
+  standalone asset in both publish eras. The render is byte-exact with
+  `tpkg::lazy::Blksum::render`, golden-pinned in `spec/blksum_spec.rb`.
 - **`TebakoRelease::Platform`** — the release-side platform vocabulary
   (the `(os, arch) → host_id` table; mirrors `tpkg::Platform`, drift fails
   loudly in factory CI).
