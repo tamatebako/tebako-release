@@ -323,8 +323,25 @@ RSpec.describe TebakoRelease::Uploader do
     expect(entry[:image]).to eq(
       filename: "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64.tfs",
       sha256: Digest::SHA256.file(img).hexdigest,
-      size_bytes: img.size
+      size_bytes: img.size,
+      blksum: {
+        filename: "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64.tfs.blksum.json",
+        sha256: TebakoRelease::Blksum.for_image(img).digest
+      }
     )
+  end
+
+  # Spec 39 §3: the derivation is the publisher's, staged beside the image
+  # at entry-build time (a pure function of the staged bytes — the same
+  # derivable class as the .sha256 sidecars).
+  it "stages the derived blksum sidecar beside the image at entry-build time" do
+    exe = package("tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64")
+    img = package("tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64.tfs")
+
+    manager.build_manifest_entries([exe, img])
+
+    staged = @dir.join("tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64.tfs.blksum.json")
+    expect(staged.read).to eq(TebakoRelease::Blksum.for_image(img).render)
   end
 
   it "omits the image key when the package has no sibling image" do
@@ -669,6 +686,52 @@ RSpec.describe TebakoRelease::Uploader do
       expected.each { |name| store.assets << FakeAsset.new(store.assets.size + 1, name) }
 
       expect { fake_manager.verify_completeness(release, require_signatures: false) }.not_to raise_error
+    end
+
+    # Spec 39 §3's audit arm: the shard is the declaration's only
+    # authority — the derived blksum sidecar is expected (with its own
+    # metadata) exactly when the shard pins `image.blksum`.
+    describe "the blksum expectation (spec 39 §3)" do
+      let(:sidecar) { "#{stem}.tfs.blksum.json" }
+
+      def declare_blksum(pin)
+        shard = { "filename" => stem, "image" => { "filename" => "#{stem}.tfs" } }
+        shard["image"]["blksum"] = pin if pin
+        store.set_content("https://download.test/#{stem}.manifest.json", JSON.generate(shard))
+      end
+
+      it "expects the declared sidecar and its own sidecar — and passes when both landed" do
+        declare_blksum("filename" => sidecar, "sha256" => "c" * 64)
+        (expected + [sidecar, "#{sidecar}.sha256"])
+          .each { |name| store.assets << FakeAsset.new(store.assets.size + 1, name, "https://download.test/#{name}") }
+
+        expect { fake_manager.verify_completeness(release) }.not_to raise_error
+      end
+
+      it "fails loud when the declared sidecar never landed" do
+        declare_blksum("filename" => sidecar, "sha256" => "c" * 64)
+        expected.each { |name| store.assets << FakeAsset.new(store.assets.size + 1, name, "https://download.test/#{name}") }
+
+        expect { fake_manager.verify_completeness(release) }
+          .to raise_error(/incomplete.*1 missing/)
+          .and output(/Missing asset: #{Regexp.escape(sidecar)}/).to_stdout
+      end
+
+      it "expects nothing of a pre-blksum shard (the additive-key compat rule)" do
+        declare_blksum(nil)
+        expected.each { |name| store.assets << FakeAsset.new(store.assets.size + 1, name, "https://download.test/#{name}") }
+
+        expect { fake_manager.verify_completeness(release) }.not_to raise_error
+      end
+
+      it "expects nothing when the shard itself never landed (its own gap reports)" do
+        [stem, "#{stem}.tfs", "#{stem}.sha256", "#{stem}.tfs.sha256"]
+          .each { |name| store.assets << FakeAsset.new(store.assets.size + 1, name, "https://download.test/#{name}") }
+
+        expect { fake_manager.verify_completeness(release) }
+          .to raise_error(/incomplete.*1 missing/)
+          .and output(/Missing asset: #{Regexp.escape("#{stem}.manifest.json")}/).to_stdout
+      end
     end
   end
 
@@ -1561,13 +1624,24 @@ RSpec.describe TebakoRelease::Uploader do
       with_packages { fake_manager.process_release }
 
       stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
-      expect(store.uploads).to contain_exactly(stem, "#{stem}.tfs",
-                                               "#{stem}.manifest.json", "#{stem}.sha256", "#{stem}.tfs.sha256")
+      expect(store.uploads).to contain_exactly(stem, "#{stem}.tfs", "#{stem}.tfs.blksum.json",
+                                               "#{stem}.manifest.json", "#{stem}.sha256", "#{stem}.tfs.sha256",
+                                               "#{stem}.tfs.blksum.json.sha256")
       # No shared file exists anymore (spec 13 §2a): the monoliths are
       # consumer-side derivations and the notes are written once at
       # release creation — a platform publish never writes either.
       expect(store.uploads).not_to include("SHA256SUMS.txt", "manifest.json")
       expect(store.updates).to be_empty
+
+      # The shard pins the derived sidecar (spec 39 §3), and the served
+      # sidecar bytes ARE the byte-exact render of the staged image.
+      shard = JSON.parse(store.content_for("https://download.test/#{stem}.manifest.json"))
+      expect(shard["image"]["blksum"]["filename"]).to eq("#{stem}.tfs.blksum.json")
+      blksum_bytes = store.content_for("https://download.test/#{stem}.tfs.blksum.json")
+      expect(blksum_bytes).to eq(TebakoRelease::Blksum.for_image(@dir.join("runtime-packages/#{stem}.tfs")).render)
+      expect(shard["image"]["blksum"]["sha256"]).to eq(Digest::SHA256.hexdigest(blksum_bytes))
+      expect(store.content_for("https://download.test/#{stem}.tfs.blksum.json.sha256"))
+        .to eq("#{Digest::SHA256.hexdigest(blksum_bytes)}  #{stem}.tfs.blksum.json\n")
     end
 
     # The 0.16.6 re-publish end-to-end: the release already carries the
@@ -1678,6 +1752,13 @@ RSpec.describe TebakoRelease::Uploader do
         .to eq("#{Digest::SHA256.file(exe).hexdigest}  #{stem}\n")
       expect(store.content_for("https://download.test/#{stem}.tfs.sha256"))
         .to eq("#{Digest::SHA256.file(img).hexdigest}  #{stem}.tfs\n")
+      # The spec 39 §3 pin: the shard declares the derived sidecar and the
+      # sidecar — a served standalone asset — earns its own .sha256.
+      expect(shard["image"]["blksum"])
+        .to eq("filename" => "#{stem}.tfs.blksum.json",
+               "sha256" => TebakoRelease::Blksum.for_image(img).digest)
+      expect(store.content_for("https://download.test/#{stem}.tfs.blksum.json.sha256"))
+        .to eq("#{TebakoRelease::Blksum.for_image(img).digest}  #{stem}.tfs.blksum.json\n")
     end
 
     it "is idempotent: a second publish of the same bytes uploads no metadata" do
@@ -1932,7 +2013,11 @@ RSpec.describe TebakoRelease::Uploader do
       with_packages { fake_manager.process_release }
 
       stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
-      expect(store.uploads).to contain_exactly("#{stem}.tar.gz", "#{stem}.tar.gz.sha256", "#{stem}.manifest.json")
+      # The bundle is the ONE served payload; the blksum sidecar (spec 39
+      # §3) is a STANDALONE asset in this era too — the lazy resolver GETs
+      # it against its own release-asset URL, never out of the bundle.
+      expect(store.uploads).to contain_exactly("#{stem}.tar.gz", "#{stem}.tar.gz.sha256", "#{stem}.manifest.json",
+                                               "#{stem}.tfs.blksum.json", "#{stem}.tfs.blksum.json.sha256")
 
       bundle_bytes = store.content_for("https://download.test/#{stem}.tar.gz")
       members = read_bundle_bytes(bundle_bytes)
@@ -1944,6 +2029,11 @@ RSpec.describe TebakoRelease::Uploader do
       expect(shard["filename"]).to eq(stem)
       expect(shard["sha256"]).to eq(Digest::SHA256.hexdigest("bytes-of-#{stem}"))
       expect(shard["image"]["sha256"]).to eq(Digest::SHA256.hexdigest("bytes-of-#{stem}.tfs"))
+      expect(shard["image"]["blksum"]["filename"]).to eq("#{stem}.tfs.blksum.json")
+      blksum_bytes = store.content_for("https://download.test/#{stem}.tfs.blksum.json")
+      expect(blksum_bytes)
+        .to eq(TebakoRelease::Blksum.for_image(@dir.join("runtime-packages/#{stem}.tfs")).render)
+      expect(shard["image"]["blksum"]["sha256"]).to eq(Digest::SHA256.hexdigest(blksum_bytes))
       expect(shard["bundle"]).to eq(
         "filename" => "#{stem}.tar.gz",
         "sha256" => Digest::SHA256.hexdigest(bundle_bytes),
@@ -1960,7 +2050,8 @@ RSpec.describe TebakoRelease::Uploader do
 
       with_packages { fake_manager.process_release }
 
-      expect(store.uploads).to contain_exactly("#{stem}.tar.gz", "#{stem}.tar.gz.sha256", "#{stem}.manifest.json")
+      expect(store.uploads).to contain_exactly("#{stem}.tar.gz", "#{stem}.tar.gz.sha256", "#{stem}.manifest.json",
+                                               "#{stem}.tfs.blksum.json", "#{stem}.tfs.blksum.json.sha256")
       members = read_bundle_bytes(store.content_for("https://download.test/#{stem}.tar.gz"))
       expect(members.map(&:first)).to eq(["#{stem}.exe", "#{stem}.tfs", "#{stem}.dll", "SHA256SUMS"])
       shard = JSON.parse(store.content_for("https://download.test/#{stem}.manifest.json"))
@@ -2013,6 +2104,42 @@ RSpec.describe TebakoRelease::Uploader do
 
       with_packages do
         expect { fake_manager.process_release }.to output(/AUDIT mode/).to_stdout
+      end
+      expect(store.uploads).to be_empty
+    end
+
+    it "audit expects the shard-declared blksum sidecar alongside the bundle (spec 39 §3)" do
+      ENV["AUDIT_ONLY"] = "true"
+      stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
+      sidecar = "#{stem}.tfs.blksum.json"
+      store.set_content("https://download.test/#{stem}.manifest.json",
+                        JSON.generate("filename" => stem,
+                                      "image" => { "filename" => "#{stem}.tfs",
+                                                   "blksum" => { "filename" => sidecar, "sha256" => "c" * 64 } }))
+      ["#{stem}.tar.gz", "#{stem}.tar.gz.sha256", "#{stem}.manifest.json", sidecar, "#{sidecar}.sha256"]
+        .each_with_index { |name, index| store.assets << FakeAsset.new(index + 1, name, "https://download.test/#{name}") }
+
+      with_packages do
+        expect { fake_manager.process_release }.to output(/AUDIT mode/).to_stdout
+      end
+      expect(store.uploads).to be_empty
+    end
+
+    it "audit fails when the shard-declared blksum sidecar never landed (spec 39 §3)" do
+      ENV["AUDIT_ONLY"] = "true"
+      stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
+      sidecar = "#{stem}.tfs.blksum.json"
+      store.set_content("https://download.test/#{stem}.manifest.json",
+                        JSON.generate("filename" => stem,
+                                      "image" => { "filename" => "#{stem}.tfs",
+                                                   "blksum" => { "filename" => sidecar, "sha256" => "c" * 64 } }))
+      ["#{stem}.tar.gz", "#{stem}.tar.gz.sha256", "#{stem}.manifest.json"]
+        .each_with_index { |name, index| store.assets << FakeAsset.new(index + 1, name, "https://download.test/#{name}") }
+
+      with_packages do
+        expect { fake_manager.process_release }
+          .to raise_error(/incomplete \(1 missing/)
+          .and output(/Missing asset: #{Regexp.escape(sidecar)}/).to_stdout
       end
       expect(store.uploads).to be_empty
     end
