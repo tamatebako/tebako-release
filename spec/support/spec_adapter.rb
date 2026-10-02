@@ -41,3 +41,11 @@ class BundleSpecAdapter < SpecAdapter
     true
   end
 end
+
+# The spec 36 §3 co-publish opt-in: a bundle-era factory whose consumers
+# include the lazy arm — the per-file assets ride beside the bundle.
+class CopublishSpecAdapter < BundleSpecAdapter
+  def per_file_alongside_bundle?
+    true
+  end
+end

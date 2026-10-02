@@ -437,7 +437,7 @@ module TebakoRelease
       nil
     end
 
-    def manifest_entry(package, image = nil, dll = nil, bundle: nil) # rubocop:disable Metrics/AbcSize, Metrics/MethodLength
+    def manifest_entry(package, image = nil, dll = nil, bundle: nil) # rubocop:disable Metrics/AbcSize, Metrics/MethodLength, Metrics/CyclomaticComplexity
       runtime_version, platform = parse_package_filename(package.basename.to_s)
       contract = contract_sidecar(package)
       filename = package.basename.to_s
@@ -470,6 +470,11 @@ module TebakoRelease
         entry[:image] = image_entry(image, blksum) if image
         entry[:dll] = dll_entry(dll, runtime_version, platform) if dll
         entry[:bundle] = bundle_entry(bundle) if bundle
+        # Spec 36 §3's co-publish witness (runtime-manifest MINOR 2):
+        # true declares the per-file assets are served standalone beside
+        # the bundle — the lazy arm's gate on bundle-declaring shards
+        # (spec 39 §7). Never emitted on bundle-only lines.
+        entry[:per_file_assets] = true if bundle && copublish?
         declare_signatures(entry)
       end
     end
@@ -530,7 +535,13 @@ module TebakoRelease
       return unless signing_enabled?
 
       keyid = signing_keyid
-      return declare_bundle_signature(entry, keyid) if entry[:bundle]
+      declare_bundle_signature(entry, keyid) if entry[:bundle]
+      # Bundle-only lines serve no other payload asset — declaring the
+      # members' .ascs there would be an invalid signing state (spec 09
+      # §4). A co-published line (spec 36 §3, the shard's per_file_assets
+      # witness) serves the members standalone, so the every-served-name
+      # rule covers the exe/image/dll set again.
+      return if entry[:bundle] && !entry[:per_file_assets]
 
       entry[:signature] = { keyid: keyid, asc: "#{entry[:filename]}.asc" }
       %i[image dll].each do |facet|
@@ -539,10 +550,10 @@ module TebakoRelease
       end
     end
 
-    # Bundle-era (spec 36 §3): the only served payload is the bundle —
-    # three signatures per leg (bundle, its sidecar, the shard). The
-    # exe/image/dll member pins are NOT served assets; declaring their
-    # .asc would be an invalid signing state (spec 09 §4).
+    # Bundle-era (spec 36 §3): the bundle's own signature declaration.
+    # On bundle-only lines it is the ONLY payload signature — three
+    # signatures per leg (bundle, its sidecar, the shard); co-published
+    # lines add the per-file declarations on top (declare_signatures).
     def declare_bundle_signature(entry, keyid)
       entry[:bundle][:signature] = { keyid: keyid, asc: "#{entry[:bundle][:filename]}.asc" }
     end
@@ -832,11 +843,16 @@ module TebakoRelease
     # feeds the entry's bundle block and the idempotent skip), upload the
     # bundles as the legs' only payload assets, then the metadata (shard
     # with the bundle block + the bundle's sidecar). The member files
-    # themselves never become release assets — the bundle is the unit.
+    # themselves never become release assets — the bundle is the unit —
+    # UNLESS the factory co-publishes (spec 36 §3): then the members are
+    # standalone served names beside the bundle (the lazy arm
+    # range-fetches the image), still ahead of the shard that witnesses
+    # them (a witnessed shard without its assets is the invalid publish).
     def process_bundle_release(release, packages)
       bundles = build_bundles(packages)
       entries = build_manifest_entries(packages, bundles: bundles)
       bundles.each_value { |bundle| upload_package(release, bundle) }
+      packages.each { |package| upload_package(release, package) } if copublish?
       upload_blksum_sidecars(release, entries)
       entries.each { |entry| ensure_package_metadata(release, entry) }
       print_settled_summary
@@ -875,6 +891,14 @@ module TebakoRelease
     # env knob — the publish shape is the factory's policy, spec 00 §10).
     def bundle_publish?
       @config.adapter.bundle_publish?
+    end
+
+    # Spec 36 §3's co-publish mode: a bundle-era line that ALSO serves
+    # the per-file assets as standalone release assets (the lazy arm's
+    # serving requirement — spec 39 §7). Factory-declared through the
+    # adapter, like the era.
+    def copublish?
+      bundle_publish? && @config.adapter.per_file_alongside_bundle?
     end
 
     # AUDIT_ONLY (the coordinator's release job / a publish dry run):
@@ -943,18 +967,25 @@ module TebakoRelease
     # era: the exe, its .tfs image and its .dll facet. Bundle era (spec 36
     # §3): the bundle is the ONE served payload asset — the entry's
     # exe/image/dll fields are member pins, not served names, so they earn
-    # no sidecar. Both eras: the derived blksum sidecar (spec 39 §3) IS a
-    # served standalone asset, so it earns its own .sha256 sidecar like
+    # no sidecar — UNLESS the entry carries the co-publish witness, when
+    # the members ARE served standalone beside the bundle and earn theirs.
+    # Both eras: the derived blksum sidecar (spec 39 §3) IS a served
+    # standalone asset, so it earns its own .sha256 sidecar like
     # every served name.
     def metadata_assets(entry)
-      served = if entry[:bundle]
-                 { entry[:bundle][:filename] => entry[:bundle][:sha256] }
-               else
-                 { entry[:filename] => entry[:sha256] }
-                   .merge(facet_metadata(entry, :image))
-                   .merge(facet_metadata(entry, :dll))
-               end
+      served = bundle_metadata(entry)
+      served.merge!(per_file_metadata(entry)) unless entry[:bundle] && !entry[:per_file_assets]
       served.merge(blksum_metadata(entry))
+    end
+
+    def bundle_metadata(entry)
+      entry[:bundle] ? { entry[:bundle][:filename] => entry[:bundle][:sha256] } : {}
+    end
+
+    def per_file_metadata(entry)
+      { entry[:filename] => entry[:sha256] }
+        .merge(facet_metadata(entry, :image))
+        .merge(facet_metadata(entry, :dll))
     end
 
     def facet_metadata(entry, facet)
@@ -1183,7 +1214,7 @@ module TebakoRelease
 
       exe = [name, "#{name}.exe"].find { |candidate| present.include?(candidate) }
       landed, missing = expected_facets(name).partition { |facet| present.include?(facet) }
-      landed, missing = split_blksum_expectation(release, present, name, landed, missing)
+      landed, missing = split_blksum_expectation(served_shard(release, present, name), present, landed, missing)
       missing.unshift(name) unless exe
       return missing if exe.nil?
 
@@ -1194,12 +1225,17 @@ module TebakoRelease
     # asset; a landed bundle owes its sidecar and the package's shard
     # (plus an .asc of each on signing-enabled audits). The declared
     # blksum sidecar (spec 39 §3) is a standalone served asset in this
-    # era too — expected, with its own metadata, when the shard pins it.
+    # era too — expected, with its own metadata, when the shard pins it —
+    # and a shard carrying the co-publish witness (spec 36 §3's
+    # per_file_assets) owes the standalone per-file assets beside the
+    # bundle.
     def missing_bundle_assets(release, present, name, require_signatures: false)
       bundle = "#{name}#{Bundler::BUNDLE_SUFFIX}"
       return [bundle] unless present.include?(bundle)
 
-      landed, missing = split_blksum_expectation(release, present, name, [bundle], [])
+      shard = served_shard(release, present, name)
+      landed, missing = split_blksum_expectation(shard, present, [bundle], [])
+      landed, missing = split_copublish_expectation(shard, present, name, landed, missing)
       missing + missing_metadata(present, name, landed, require_signatures: require_signatures)
     end
 
@@ -1212,8 +1248,8 @@ module TebakoRelease
     # the shard's own gap is the gate's business). A DECLARED sidecar that
     # never landed reports its own name only — its sidecar/.asc cascade
     # rides the landed set, one error per gap.
-    def split_blksum_expectation(release, present, name, landed, missing)
-      declared = declared_blksum_name(release, present, name)
+    def split_blksum_expectation(shard, present, landed, missing)
+      declared = shard&.dig("image", "blksum", "filename")
       return [landed, missing] unless declared
 
       if present.include?(declared)
@@ -1223,17 +1259,35 @@ module TebakoRelease
       end
     end
 
-    # The sidecar name the package's shard declares (`image.blksum`),
-    # nil when undeclared, when the shard never landed, or when it cannot
-    # be read (loudly — the audit never guesses an expectation).
-    def declared_blksum_name(release, present, name)
+    # The shard-witnessed co-publish expectation (spec 36 §3): a shard
+    # carrying per_file_assets: true owes the standalone per-file assets —
+    # the exe (either spelling), the image, the windows DLL — beside the
+    # bundle; each landed member earns its metadata through the landed
+    # set. An unwitnessed shard expects nothing (bundle-only lines audit
+    # green), and a missing exe reports its own gap only, never a
+    # cascade (the one-error-per-gap rule).
+    def split_copublish_expectation(shard, present, name, landed, missing)
+      return [landed, missing] unless shard && shard["per_file_assets"] == true
+
+      exe = [name, "#{name}.exe"].find { |candidate| present.include?(candidate) }
+      facets_landed, facets_missing = expected_facets(name).partition { |facet| present.include?(facet) }
+      gaps = facets_missing
+      gaps = [name] + gaps unless exe
+      [landed + [exe, *facets_landed].compact, missing + gaps]
+    end
+
+    # The package's served shard as parsed JSON — the declarations' only
+    # authority (the additive keys gate the audit's expectations). nil
+    # when the shard never landed (its own gap is the gate's business) or
+    # cannot be read (loudly — the audit never guesses an expectation).
+    def served_shard(release, present, name)
       shard = "#{name}#{SHARD_SUFFIX}"
       return nil unless present.include?(shard)
 
-      download_asset_json(find_asset(release, shard)).dig("image", "blksum", "filename")
+      download_asset_json(find_asset(release, shard))
     rescue StandardError => e
-      puts "::warning::could not read #{shard} for the blksum expectation (#{e.class}: #{e.message}) — " \
-           "no blksum sidecar is expected of this package"
+      puts "::warning::could not read #{shard} for the additive expectations (#{e.class}: #{e.message}) — " \
+           "no additive assets are expected of this package"
       nil
     end
 
