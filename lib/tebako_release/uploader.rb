@@ -29,6 +29,7 @@ require "octokit"
 require "digest"
 require "json"
 require "pathname"
+require "stringio"
 require "tmpdir"
 require "yaml"
 
@@ -956,7 +957,7 @@ module TebakoRelease
     # metadata describes what the release serves, never the fresh bytes
     # that did not land.
     def ensure_package_metadata(release, entry)
-      effective = effective_entry(entry)
+      effective = effective_entry(release, entry)
       ensure_metadata_asset(release, shard_name_for(effective), "#{JSON.pretty_generate(effective)}\n")
       metadata_assets(effective).each do |name, sha|
         ensure_metadata_asset(release, "#{name}#{SIDECAR_SUFFIX}", "#{sha}  #{name}\n")
@@ -1008,12 +1009,57 @@ module TebakoRelease
     # A settled package (any of its assets kept their previous bytes) speaks
     # with the previous entry's voice; a never-published settle has nothing
     # truthful to keep and never reaches here (upload_package re-raised).
-    def effective_entry(entry)
+    # The co-publish adoption exception (spec 36 §3): the previous bundle-era
+    # entry predates the witness, and this run repaired the standalone
+    # members out of the settled bundle — the entry keeps the previous pins
+    # (they pin exactly those bytes) and gains the witness, the served
+    # blksum pin, and the members' signature declarations, each only when
+    # the asset it names verifiably landed.
+    def effective_entry(release, entry)
       names = [entry[:filename], entry.dig(:image, :filename), entry.dig(:dll, :filename),
                entry.dig(:image, :blksum, :filename)].compact
       return entry unless names.any? { |name| settled?(name) }
 
-      previous_entry_for(entry[:filename]) || entry
+      previous = previous_entry_for(entry[:filename]) || entry
+      return previous unless entry[:per_file_assets] && !previous[:per_file_assets]
+      return previous unless copublish_members_landed?(release, previous)
+
+      witnessed_repair_entry(release, previous, entry)
+    end
+
+    # The witness gate: the standalone members the previous entry pins are
+    # all on the release (landed this run through the repair, or served all
+    # along). A witness without its assets is the invalid publish.
+    def copublish_members_landed?(release, entry)
+      names = [entry[:filename], entry.dig(:image, :filename), entry.dig(:dll, :filename)].compact
+      names.all? { |name| find_asset(release, name) }
+    end
+
+    # The adoption shard: the previous entry verbatim (its pins describe
+    # the served bytes exactly) plus the co-publish witness, the blksum pin
+    # read off the landed sidecar's listing digest (byte-truthful by
+    # construction — never the fresh build's derivation), and the members'
+    # signature declarations on signing-enabled lines (spec 09 §5's
+    # every-served-name rule; the in-leg sign pass fulfills them).
+    def witnessed_repair_entry(release, previous, fresh)
+      repaired = Marshal.load(Marshal.dump(previous))
+      repaired[:per_file_assets] = true
+      blksum_name = fresh.dig(:image, :blksum, :filename)
+      blksum_sha = blksum_name && listed_digest(release, blksum_name)
+      repaired[:image][:blksum] = { filename: blksum_name, sha256: blksum_sha } if blksum_sha && repaired[:image]
+      declare_repaired_member_signatures(repaired)
+      repaired
+    end
+
+    def declare_repaired_member_signatures(entry)
+      return unless signing_enabled?
+
+      keyid = signing_keyid
+      entry[:signature] = { keyid: keyid, asc: "#{entry[:filename]}.asc" }
+      %i[image dll].each do |facet|
+        block = entry[facet]
+        block[:signature] = { keyid: keyid, asc: "#{block[:filename]}.asc" } if block
+      end
     end
 
     # One metadata asset, converged: already-current bytes (the listing's
@@ -1551,10 +1597,16 @@ module TebakoRelease
       exit 1
     end
 
-    def upload_package(release, package) # rubocop:disable Metrics/MethodLength
+    def upload_package(release, package) # rubocop:disable Metrics/MethodLength, Metrics/AbcSize
       filename = package.basename.to_s
       puts "Processing #{filename}..."
       if settled?(filename)
+        # A settled stem stands its facets down ONLY when they are on the
+        # release — a facet that never landed has nothing to keep, and on a
+        # co-publish line the byte-truthful source is the settled bundle
+        # itself (its members ARE the previous entry's pins).
+        return repair_settled_absent_asset(release, filename) if copublish? && !find_asset(release, filename)
+
         puts "#{filename} kept its previous bytes earlier in this publish run — " \
              "the settled asset is never re-attempted; the refresh lands on a republish onto a recreated release object"
         return nil
@@ -1587,6 +1639,155 @@ module TebakoRelease
            "the refresh lands on a recreated-object republish"
       settle_asset!(filename)
       nil
+    end
+
+    # The settled-stem co-publish repair (spec 36 §3 adoption on a
+    # bundle-era release): the stem settled (the byte-immutable keep — the
+    # build is not bit-reproducible), so the package speaks with the
+    # previous entry's voice — but the previous bundle-era publish never
+    # served the standalone members. The settled bundle on the release
+    # holds exactly the bytes the previous entry pins (that is what the
+    # bundle IS), so the members are served from it: extract, verify
+    # against the pin, upload. A member absent with nothing truthful to
+    # repair from (no previous entry, no pin, no bundle asset) is a named
+    # error — never a silent skip, never a lying upload.
+    def repair_settled_absent_asset(release, filename)
+      if Blksum.blksum_file?(Pathname.new(filename))
+        repair_settled_blksum(release, filename)
+      else
+        repair_settled_member(release, filename)
+      end
+    end
+
+    def repair_settled_member(release, filename)
+      entry = previous_entry_for_stem(filename)
+      bundle_asset = repair_bundle_asset(release, entry, filename)
+      member = verified_bundle_member(release, bundle_asset, entry, filename)
+      puts "Repairing #{filename} from the settled bundle #{bundle_asset.name} " \
+           "(the co-publish adoption serves the bundle's own members standalone — byte-identical with the pin)"
+      perform_upload(release, member, filename)
+      filename
+    end
+
+    # The settled bundle asset the previous entry pins this member over, or
+    # a named error: an absent member with nothing truthful to repair from
+    # (no previous entry, no pin, no bundle asset) is never silently
+    # skipped and never freshly uploaded over a settled voice.
+    def repair_bundle_asset(release, entry, filename)
+      pin = entry && member_pin_for(entry, filename)
+      bundle_asset = entry && find_asset(release, entry&.dig(:bundle, :filename))
+      return bundle_asset if pin && bundle_asset
+
+      raise Error, "#{filename} never landed on the release and its settled package has nothing truthful " \
+                   "to repair from (no previous entry pinning it over a served bundle) — " \
+                   "the refresh lands on a republish onto a recreated release object"
+    end
+
+    # The member's extraction, verified against the previous entry's pin —
+    # the bundle's contents and the shard must agree, or neither is served.
+    def verified_bundle_member(release, bundle_asset, entry, filename)
+      member = extracted_bundle_members(release, bundle_asset)[filename]
+      actual = member && Digest::SHA256.file(member).hexdigest
+      return member if member && actual == member_pin_for(entry, filename)
+
+      raise Error, "#{filename} extracted from the settled bundle #{bundle_asset.name} does not hash to the " \
+                   "package's published pin (#{actual || "not a member"}) — the bundle and the shard " \
+                   "disagree; refusing to serve either reading (byte-truthful, never a guess)"
+    end
+
+    # The derived blksum sidecar of a settled package derives from the
+    # SERVED image bytes — never the fresh build's (they did not land).
+    # The served bytes are the just-repaired extraction when this run
+    # landed the image, else the release's own image asset.
+    def repair_settled_blksum(release, filename)
+      image_name = filename.delete_suffix(Blksum::SIDECAR_SUFFIX)
+      image = served_image_path(release, image_name)
+      blksum = Blksum.for_image(image)
+      sidecar = Pathname.new(Dir.mktmpdir).join(filename).tap { |path| path.write(blksum.render) }
+      puts "Repairing #{filename} derived from the served image #{image_name} (spec 39 §3)"
+      perform_upload(release, sidecar, filename)
+      filename
+    end
+
+    def served_image_path(release, image_name)
+      extracted = repaired_image_extraction(release, image_name)
+      return extracted if extracted
+
+      asset = find_asset(release, image_name)
+      unless asset
+        raise Error, "the served image #{image_name} is not on the release — cannot derive its blksum sidecar"
+      end
+
+      bytes = with_transient_retries { @client.get(asset.browser_download_url) }.to_s
+      Pathname.new(Dir.mktmpdir).join(image_name).tap { |path| path.binwrite(bytes) }
+    end
+
+    # The image's extraction when this run repaired it (the just-landed
+    # bytes), nil when the image was never extracted here.
+    def repaired_image_extraction(release, image_name)
+      entry = previous_entry_for_stem(image_name)
+      bundle_asset = entry && find_asset(release, entry&.dig(:bundle, :filename))
+      bundle_asset && extracted_bundle_members(release, bundle_asset)[image_name]
+    end
+
+    # The previous manifest entry of the package stem an asset name belongs
+    # to (the exe, its facets, the derived sidecars, the bundle — one
+    # stem). previous_entry_covering's metadata-assets walk does not serve
+    # here: an UNWITNESSED bundle-era entry's metadata covers the bundle
+    # alone, while the repair needs the member pins it still carries.
+    def previous_entry_for_stem(filename)
+      stem = package_stem(filename)
+      previous_manifest_entries.find { |entry| package_stem(entry[:filename]) == stem }
+    end
+
+    # The previous entry's pin for one member name: the exe at the top
+    # level, the image/dll in their facet blocks. nil when the entry does
+    # not pin the name (nothing truthful to verify an extraction against).
+    def member_pin_for(entry, filename)
+      return entry[:sha256] if entry[:filename] == filename
+
+      %i[image dll].each do |facet|
+        block = entry[facet]
+        return block[:sha256] if block && block[:filename] == filename
+      end
+      nil
+    end
+
+    # The settled bundle's members, extracted once per bundle into a
+    # process-lifetime scratch dir (the exe/image/dll repairs of one stem
+    # share the one download). The bundle grammar is flat bare basenames
+    # (Bundler writes them so); anything else is refused, never extracted.
+    def extracted_bundle_members(release, bundle_asset)
+      @extracted_bundles ||= {}
+      @extracted_bundles[bundle_asset.name] ||= extract_bundle(release, bundle_asset)
+    end
+
+    def extract_bundle(_release, bundle_asset)
+      bytes = with_transient_retries { @client.get(bundle_asset.browser_download_url) }.to_s
+      dir = Pathname.new(Dir.mktmpdir("tebako-release-bundle-"))
+      Zlib::GzipReader.wrap(StringIO.new(bytes)) { |gzip| extract_tar_members(bundle_asset, gzip, dir) }
+    end
+
+    def extract_tar_members(bundle_asset, gzip, dir)
+      members = {}
+      Gem::Package::TarReader.new(gzip) do |tar|
+        tar.each do |tar_entry|
+          next unless tar_entry.file?
+
+          name = flat_member_name(bundle_asset, tar_entry.full_name)
+          members[name] = dir.join(name).tap { |path| path.binwrite(tar_entry.read) }
+        end
+      end
+      members
+    end
+
+    # The bundle grammar is flat bare basenames (Bundler writes them so);
+    # anything else is refused, never extracted.
+    def flat_member_name(bundle_asset, name)
+      return name if name == File.basename(name)
+
+      raise Error, "bundle #{bundle_asset.name} carries the non-flat member #{name} — " \
+                   "the spec 36 §2 grammar is bare basenames only; refusing to extract"
     end
 
     # The settled ledger — the durable half of warn-and-keep-previous. The
