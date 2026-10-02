@@ -830,7 +830,7 @@ RSpec.describe TebakoRelease::Uploader do
 
       expect { fake_manager.upload_package(release, exe) }
         .to output(/keeping the previous asset/).to_stdout
-      expect(fake_manager.effective_entry({ filename: exe.basename.to_s, sha256: "2" * 64 }))
+      expect(fake_manager.effective_entry(release, { filename: exe.basename.to_s, sha256: "2" * 64 }))
         .to eq(previous)
     end
 
@@ -1312,7 +1312,7 @@ RSpec.describe TebakoRelease::Uploader do
       second = described_class.new(client: FakeClient.new(store))
       allow(second).to receive(:previous_manifest_entries).and_return([previous])
 
-      expect(second.effective_entry(fresh)).to eq(previous)
+      expect(second.effective_entry(release, fresh)).to eq(previous)
     end
 
     # A fully-wedged asset: every POST 422s, every delete never
@@ -1519,7 +1519,7 @@ RSpec.describe TebakoRelease::Uploader do
         .to_stdout
       expect(store.deletes).to be_empty
       expect(store.uploads).to be_empty
-      expect(fake_manager.effective_entry(entries.first)[:sha256]).to eq("f" * 64)
+      expect(fake_manager.effective_entry(release, entries.first)[:sha256]).to eq("f" * 64)
     end
 
     # Missing is not different bytes: a name the release does not carry
@@ -2296,6 +2296,149 @@ RSpec.describe TebakoRelease::Uploader do
         expect { fake_manager.process_release }.to output(/AUDIT mode/).to_stdout
       end
       expect(store.uploads).to be_empty
+    end
+
+    # The adoption moment (the 0.16.32 smoke publish, run 37013657799): a
+    # bundle-era release republished on a co-publish line. The fresh build
+    # is not bit-reproducible, so the bundle keeps its previous bytes and
+    # the stem settles — and the standalone members, never served before,
+    # are repaired out of the settled bundle itself (its members ARE the
+    # previous entry's pins). The shard keeps the previous pins and gains
+    # the witness, the served blksum pin, and the members' sidecars.
+    describe "settled-stem adoption repair" do
+      let(:release) { FakeRelease.new(store) }
+      let(:stem) { "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64" }
+      let(:orig_exe) { "original-exe-bytes-#{stem}" }
+      let(:orig_tfs) { "original-tfs-bytes-#{stem}" }
+
+      # The previously published bundle-era state: the bundle asset (real
+      # tar.gz bytes minted by the Bundler over the ORIGINAL members), its
+      # sidecar, and the unwitnessed shard pinning those members.
+      def publish_bundle_era_state(corrupt: false)
+        bundle_bytes = mint_original_bundle(corrupt: corrupt)
+        register_served_asset("#{stem}.tar.gz", bundle_bytes)
+        register_served_asset("#{stem}.tar.gz.sha256", "#{Digest::SHA256.hexdigest(bundle_bytes)}  #{stem}.tar.gz\n")
+        register_shard(bundle_bytes)
+      end
+
+      def register_shard(bundle_bytes)
+        asset = FakeAsset.new(3, "#{stem}.manifest.json", "https://download.test/#{stem}.manifest.json")
+        store.assets << asset
+        store.set_content(asset.browser_download_url, JSON.generate(previous_bundle_era_entry(bundle_bytes)))
+      end
+
+      def mint_original_bundle(corrupt: false)
+        bundle_dir = @dir.join("originals").tap(&:mkpath)
+        exe = bundle_dir.join(stem).tap { |path| path.binwrite(orig_exe) }
+        tfs = bundle_dir.join("#{stem}.tfs").tap { |path| path.binwrite(corrupt ? "tampered" : orig_tfs) }
+        File.binread(TebakoRelease::Bundler.new.build(bundle_dir, stem, exe: exe, image: tfs))
+      end
+
+      def previous_bundle_era_entry(bundle_bytes)
+        { filename: stem, sha256: Digest::SHA256.hexdigest(orig_exe), size_bytes: orig_exe.bytesize,
+          platform: "macos-arm64",
+          image: { filename: "#{stem}.tfs", sha256: Digest::SHA256.hexdigest(orig_tfs),
+                   size_bytes: orig_tfs.bytesize },
+          bundle: { filename: "#{stem}.tar.gz", sha256: Digest::SHA256.hexdigest(bundle_bytes),
+                    size_bytes: bundle_bytes.bytesize } }
+      end
+
+      def register_served_asset(name, bytes)
+        asset = FakeAsset.new(store.assets.size + 10, name, "https://download.test/#{name}")
+        asset.digest = "sha256:#{Digest::SHA256.hexdigest(bytes)}"
+        store.assets << asset
+        store.set_content(asset.browser_download_url, bytes)
+      end
+
+      it "repairs the never-served members from the settled bundle, byte-truthful with the pins" do
+        publish_bundle_era_state
+        stage_packages(stem, "#{stem}.tfs") # the fresh, non-reproducible build
+
+        with_packages { fake_manager.process_release }
+
+        expect(store.uploads).to include(stem, "#{stem}.tfs", "#{stem}.tfs.blksum.json",
+                                         "#{stem}.sha256", "#{stem}.tfs.sha256",
+                                         "#{stem}.tfs.blksum.json.sha256", "#{stem}.manifest.json")
+        # The served standalone bytes ARE the bundle's members, never the
+        # fresh build's (which kept its previous voice throughout).
+        expect(store.content_for("https://download.test/#{stem}")).to eq(orig_exe)
+        expect(store.content_for("https://download.test/#{stem}.tfs")).to eq(orig_tfs)
+        served_blksum = JSON.parse(store.content_for("https://download.test/#{stem}.tfs.blksum.json"))
+        expect(served_blksum["sha256"]).to eq(Digest::SHA256.hexdigest(orig_tfs))
+        # The shard: previous pins intact, the witness and the blksum pin gained.
+        shard = JSON.parse(store.content_for("https://download.test/#{stem}.manifest.json"))
+        expect(shard["per_file_assets"]).to be(true)
+        expect(shard["sha256"]).to eq(Digest::SHA256.hexdigest(orig_exe))
+        expect(shard["image"]["sha256"]).to eq(Digest::SHA256.hexdigest(orig_tfs))
+        expect(shard["image"]["blksum"]["filename"]).to eq("#{stem}.tfs.blksum.json")
+        expect(shard["image"]["blksum"]["sha256"])
+          .to eq(Digest::SHA256.hexdigest(store.content_for("https://download.test/#{stem}.tfs.blksum.json")))
+      end
+
+      it "declares the members' signatures on a signing-enabled repaired line" do
+        ENV["TEBAKO_RELEASE_SIGNING_ENABLED"] = "true"
+        ENV["TEBAKO_RELEASE_SIGNING_KEYID"] = "efc3c250f7862a48"
+        publish_bundle_era_state
+        stage_packages(stem, "#{stem}.tfs")
+
+        with_packages { fake_manager.process_release }
+
+        shard = JSON.parse(store.content_for("https://download.test/#{stem}.manifest.json"))
+        expect(shard["signature"]).to eq("keyid" => "efc3c250f7862a48", "asc" => "#{stem}.asc")
+        expect(shard["image"]["signature"]).to eq("keyid" => "efc3c250f7862a48", "asc" => "#{stem}.tfs.asc")
+      end
+
+      it "refuses loudly when the settled bundle's member disagrees with the shard's pin" do
+        publish_bundle_era_state(corrupt: true)
+        stage_packages(stem, "#{stem}.tfs")
+
+        with_packages do
+          expect { fake_manager.process_release }
+            .to raise_error(TebakoRelease::Error, /refusing to serve either reading/)
+        end
+        # The untampered exe repaired truthfully before the raise; the
+        # corrupt image and everything derived from it never landed.
+        expect(store.uploads).not_to include("#{stem}.tfs", "#{stem}.tfs.blksum.json")
+      end
+
+      it "names the recreated-object republish when nothing truthful can repair an absent member" do
+        stem2 = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
+        previous = { filename: stem2, sha256: "1" * 64,
+                     image: { filename: "#{stem2}.tfs", sha256: "2" * 64, size_bytes: 1 } }
+        store.assets << FakeAsset.new(1, "#{stem2}.manifest.json", "https://download.test/#{stem2}.manifest.json")
+        store.set_content("https://download.test/#{stem2}.manifest.json", JSON.generate(previous))
+        fake_manager.settle_asset!(stem2)
+        tfs = package("#{stem2}.tfs")
+
+        expect { fake_manager.upload_package(release, tfs) }
+          .to raise_error(TebakoRelease::Error, /nothing truthful to repair from/)
+        expect(store.attempts[:upload]).to eq(0)
+      end
+    end
+  end
+
+  # A bundle-era line WITHOUT the co-publish opt-in keeps the settled
+  # stand-down verbatim: an absent facet is not repaired (the line serves
+  # no standalone members by policy).
+  describe "settled stand-down without the co-publish opt-in (spec 36 §2)" do
+    let(:store) { FakeAssetStore.new }
+    let(:release) { FakeRelease.new(store) }
+    let(:bundle_config) do
+      TebakoRelease::Config.new(repo: "tamatebako/tebako-runtime-ruby", language: "ruby",
+                                title_prefix: "Tebako runtime packages",
+                                contract_yml: File.join(REPO_ROOT, "spec", "fixtures", "contract.yml"),
+                                adapter: BundleSpecAdapter.new)
+    end
+    let(:fake_manager) { described_class.new(client: FakeClient.new(store), config: bundle_config) }
+
+    it "stands an absent facet down with the settled message, never a repair" do
+      stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
+      fake_manager.settle_asset!(stem)
+      tfs = package("#{stem}.tfs")
+
+      expect { fake_manager.upload_package(release, tfs) }
+        .to output(/never re-attempted/).to_stdout
+      expect(store.attempts[:upload]).to eq(0)
     end
   end
 end
