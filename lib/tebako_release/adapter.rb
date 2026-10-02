@@ -55,5 +55,18 @@ module TebakoRelease
     def bundle_publish?
       false
     end
+
+    # Spec 36 §3's co-publish: when true (and bundle_publish? holds), each
+    # leg ALSO serves the per-file assets — the exe under its historical
+    # spelling, the env image, the windows DLL — as standalone release
+    # assets beside the bundle, each with its .sha256 sidecar. The lazy
+    # arm (spec 39 §7) range-fetches the image's groups over HTTP, which
+    # is impossible inside the gzip stream; the shard gains the additive
+    # per_file_assets witness (runtime-manifest MINOR 2) that gates the
+    # loaders' lazy arm on bundle-declaring shards. Default off: a
+    # factory opts in when its consumers include the lazy arm.
+    def per_file_alongside_bundle?
+      false
+    end
   end
 end

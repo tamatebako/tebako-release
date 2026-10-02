@@ -23,7 +23,12 @@ through a small adapter file and pin this gem — they never carry copies.
   in-bundle SHA256SUMS; fixed member order, mtime=0 — identical inputs
   yield identical bytes). A factory opts into the bundle-era publish shape
   through its adapter (`bundle_publish? → true`); the per-file shape stays
-  the default for pre-bundle lines.
+  the default for pre-bundle lines. Bundle-era lines whose consumers
+  include the lazy arm additionally opt into co-publish
+  (`per_file_alongside_bundle? → true`, spec 36 §3): the staged members
+  are served as standalone assets beside the bundle, the shard carries
+  the `per_file_assets` witness (runtime-manifest MINOR 2), the facet
+  signature declarations return, and the audit expects the union.
 - **`TebakoRelease::Blksum`** — the spec 39 §3 block-group digest sidecar
   (`<image>.blksum.json`: one sha256 per 4 MiB group of env-image bytes,
   the lazy mount's range-GET trust anchor). The uploader derives it

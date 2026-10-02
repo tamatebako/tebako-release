@@ -2160,4 +2160,142 @@ RSpec.describe TebakoRelease::Uploader do
       end
     end
   end
+
+  # Spec 36 §3's co-publish: a bundle-era line whose consumers include the
+  # lazy arm ALSO serves the per-file assets standalone beside the bundle;
+  # the shard carries the per_file_assets witness (runtime-manifest
+  # MINOR 2) and the audit expects the union.
+  describe "bundle-era co-publish (spec 36 §3)" do
+    let(:store) { FakeAssetStore.new }
+    let(:client) { FakeClient.new(store) }
+    let(:copublish_config) do
+      TebakoRelease::Config.new(repo: "tamatebako/tebako-runtime-ruby", language: "ruby",
+                                title_prefix: "Tebako runtime packages",
+                                contract_yml: File.join(REPO_ROOT, "spec", "fixtures", "contract.yml"),
+                                adapter: CopublishSpecAdapter.new)
+    end
+    let(:fake_manager) { described_class.new(client: client, config: copublish_config) }
+
+    before { allow(fake_manager).to receive(:sleep) }
+
+    def stage_packages(*names)
+      dir = @dir.join("runtime-packages")
+      dir.mkdir
+      names.each do |name|
+        path = dir.join(name)
+        path.write("bytes-of-#{name}")
+        write_contract_sidecar(path) unless name.end_with?(".tfs", ".dll")
+      end
+    end
+
+    it "is off by default — a factory opts in deliberately, separately from the era" do
+      expect(TebakoRelease::Adapter.new.per_file_alongside_bundle?).to be(false)
+      expect(BundleSpecAdapter.new.per_file_alongside_bundle?).to be(false)
+    end
+
+    it "serves the bundle AND the standalone members, each with its sidecar" do
+      stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
+      stage_packages(stem, "#{stem}.tfs")
+
+      with_packages { fake_manager.process_release }
+
+      expect(store.uploads).to contain_exactly(
+        "#{stem}.tar.gz", "#{stem}.tar.gz.sha256", "#{stem}.manifest.json",
+        stem, "#{stem}.sha256", "#{stem}.tfs", "#{stem}.tfs.sha256",
+        "#{stem}.tfs.blksum.json", "#{stem}.tfs.blksum.json.sha256"
+      )
+    end
+
+    it "carries the per_file_assets witness with the bundle block and the member pins intact" do
+      stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
+      stage_packages(stem, "#{stem}.tfs")
+
+      with_packages { fake_manager.process_release }
+
+      shard = JSON.parse(store.content_for("https://download.test/#{stem}.manifest.json"))
+      expect(shard["per_file_assets"]).to be(true)
+      expect(shard["bundle"]["filename"]).to eq("#{stem}.tar.gz")
+      # The member pins ARE the standalone pins — one staged file, one
+      # digest, two serving forms.
+      expect(shard["sha256"]).to eq(Digest::SHA256.hexdigest("bytes-of-#{stem}"))
+      expect(shard["image"]["sha256"]).to eq(Digest::SHA256.hexdigest("bytes-of-#{stem}.tfs"))
+      expect(shard["image"]["blksum"]["filename"]).to eq("#{stem}.tfs.blksum.json")
+    end
+
+    it "serves the windows DLL standalone too, beside the bundle" do
+      ENV["EXPECTED_ENV_MATRIX"] = '[{"host":"windows-2022","container":null,"os":"windows","arch":"x86_64"}]'
+      stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-windows-ucrt64"
+      stage_packages("#{stem}.exe", "#{stem}.tfs", "#{stem}.dll")
+
+      with_packages { fake_manager.process_release }
+
+      expect(store.uploads).to include("#{stem}.exe", "#{stem}.exe.sha256",
+                                       "#{stem}.dll", "#{stem}.dll.sha256",
+                                       "#{stem}.tfs", "#{stem}.tfs.sha256",
+                                       "#{stem}.tar.gz", "#{stem}.manifest.json")
+      shard = JSON.parse(store.content_for("https://download.test/#{stem}.manifest.json"))
+      expect(shard["per_file_assets"]).to be(true)
+      expect(shard["dll"]["sha256"]).to eq(Digest::SHA256.hexdigest("bytes-of-#{stem}.dll"))
+    end
+
+    it "declares the signature union when armed (bundle + entry + facets)" do
+      ENV["TEBAKO_RELEASE_SIGNING_ENABLED"] = "true"
+      ENV["TEBAKO_RELEASE_SIGNING_KEYID"] = "efc3c250f7862a48"
+      stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
+      stage_packages(stem, "#{stem}.tfs")
+
+      with_packages { fake_manager.process_release }
+
+      shard = JSON.parse(store.content_for("https://download.test/#{stem}.manifest.json"))
+      expect(shard["bundle"]["signature"])
+        .to eq("keyid" => "efc3c250f7862a48", "asc" => "#{stem}.tar.gz.asc")
+      expect(shard["signature"]).to eq("keyid" => "efc3c250f7862a48", "asc" => "#{stem}.asc")
+      expect(shard["image"]["signature"]).to eq("keyid" => "efc3c250f7862a48", "asc" => "#{stem}.tfs.asc")
+    end
+
+    it "audit passes on the witnessed union asset set" do
+      ENV["AUDIT_ONLY"] = "true"
+      stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
+      store.set_content("https://download.test/#{stem}.manifest.json",
+                        JSON.generate("filename" => stem, "per_file_assets" => true))
+      ["#{stem}.tar.gz", "#{stem}.tar.gz.sha256", "#{stem}.manifest.json",
+       stem, "#{stem}.sha256", "#{stem}.tfs", "#{stem}.tfs.sha256"]
+        .each_with_index { |name, index| store.assets << FakeAsset.new(index + 1, name, "https://download.test/#{name}") }
+
+      with_packages do
+        expect { fake_manager.process_release }.to output(/AUDIT mode/).to_stdout
+      end
+      expect(store.uploads).to be_empty
+    end
+
+    it "audit fails when a witnessed standalone member never landed" do
+      ENV["AUDIT_ONLY"] = "true"
+      stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
+      store.set_content("https://download.test/#{stem}.manifest.json",
+                        JSON.generate("filename" => stem, "per_file_assets" => true))
+      ["#{stem}.tar.gz", "#{stem}.tar.gz.sha256", "#{stem}.manifest.json", stem, "#{stem}.sha256"]
+        .each_with_index { |name, index| store.assets << FakeAsset.new(index + 1, name, "https://download.test/#{name}") }
+
+      with_packages do
+        expect { fake_manager.process_release }
+          .to raise_error(/incomplete/)
+          .and output(/Missing asset: #{Regexp.escape("#{stem}.tfs")}/).to_stdout
+      end
+      expect(store.uploads).to be_empty
+    end
+
+    it "audit of an UNWITNESSED bundle-era shard keeps the bundle-only expectation" do
+      ENV["AUDIT_ONLY"] = "true"
+      stem = "tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"
+      store.set_content("https://download.test/#{stem}.manifest.json",
+                        JSON.generate("filename" => stem))
+      ["#{stem}.tar.gz", "#{stem}.tar.gz.sha256", "#{stem}.manifest.json"]
+        .each_with_index { |name, index| store.assets << FakeAsset.new(index + 1, name, "https://download.test/#{name}") }
+
+      with_packages do
+        expect { fake_manager.process_release }.to output(/AUDIT mode/).to_stdout
+      end
+      expect(store.uploads).to be_empty
+    end
+  end
 end
