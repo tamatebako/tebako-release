@@ -393,6 +393,18 @@ RSpec.describe TebakoRelease::Signer do
     expect { signer.sign_release }
       .to raise_error(TebakoRelease::Signer::SigningGateError, /did not converge/)
   end
+
+  it "budgets the convergence window for campaign-scale concurrency (tebako-release#15)" do
+    delays = TebakoRelease::Signer::CONVERGENCE_DELAYS
+    expect(delays.size).to be >= 8
+    expect(delays.sum).to be_between(180, 360)
+  end
+
+  it "jitters convergence pauses within the ±40% window and keeps zero pauses zero" do
+    samples = Array.new(1000) { TebakoRelease::Signer.jittered(50) }
+    expect(samples).to all(be_within(20).of(50))
+    expect(TebakoRelease::Signer.jittered(0)).to eq(0)
+  end
 end
 
 # The real executor's transient class: 5xx and the intermediary 403 earn

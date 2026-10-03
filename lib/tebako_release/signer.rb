@@ -76,9 +76,20 @@ module TebakoRelease
     # elsewhere (openjdk's out/<flavor>-<triplet>/) at this run's dir.
     LOCAL_PACKAGES_DIR = "runtime-packages"
 
-    # upload convergence: a tiny metadata asset either lands or cycles;
-    # three bounded polls then a named failure.
-    CONVERGENCE_DELAYS = [5, 15, 30].freeze
+    # upload convergence: a tiny metadata asset either lands or cycles.
+    # Campaign-scale concurrency — dozens of sign legs replacing .asc
+    # assets on one release object — makes the 422 delete-propagation
+    # race routine, so the budget is ten jittered cycles over ~4–5
+    # minutes (tebako-release#15); the jitter keeps concurrently failing
+    # legs from re-colliding on the same propagation windows in lockstep.
+    CONVERGENCE_DELAYS = [5, 10, 15, 20, 30, 30, 30, 30, 40, 40].freeze
+    CONVERGENCE_JITTER = 0.4
+
+    # A convergence pause scaled by 1 ± CONVERGENCE_JITTER. A zero pause
+    # stays zero, so spec-stubbed delay lists keep their determinism.
+    def self.jittered(pause)
+      pause * (1 + (((rand * 2) - 1) * CONVERGENCE_JITTER))
+    end
 
     # served-bytes convergence: a young release object lists an asset before
     # the byte store serves it (the runtime-ruby 0.16.28 republish's
@@ -310,8 +321,9 @@ module TebakoRelease
         converged = asc_converged?(release, asc_file, sha)
         break if converged
 
-        puts "#{asc_file.basename} has not converged on the release yet; cycling in #{pause}s"
-        sleep pause
+        wait = Signer.jittered(pause)
+        puts "#{asc_file.basename} has not converged on the release yet; cycling in #{wait.round}s"
+        sleep wait
       end
       raise SigningGateError, "NAMED FAILURE: #{asc_file.basename} did not converge on #{@tag}" unless converged
     end
