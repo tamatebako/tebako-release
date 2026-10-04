@@ -256,7 +256,7 @@ module TebakoRelease
         next unless @config.adapter.capable_pair?(env["os"], env["arch"], version)
 
         platform = Platform.host_id_for(env["os"], env["arch"])
-        "tebako-runtime-#{@version}-#{version}-#{platform}"
+        "tebako-runtime-#{@version}-#{lang_infix}#{version}-#{platform}"
       end
     rescue JSON::ParserError => e
       puts "::warning::Could not compute expected package list: #{e.message}"
@@ -656,15 +656,42 @@ module TebakoRelease
       "#{package.basename.to_s.sub(/\.exe\z/, "")}.dll"
     end
 
+    # The language infix of the package-name grammar: "ruby-" on
+    # post-#716 publishes, empty on the pre-#716 spelling.
+    def lang_infix
+      name = @config.adapter.lang_name
+      name.nil? || name.empty? ? "" : "#{name}-"
+    end
+
+    # The dual-era package-name parse (tebako#716): the pre-#716 spelling
+    # is `tebako-runtime-<ver>-<lv>-<triplet>`; the post-#716 spelling
+    # inserts the factory's language segment. A present segment that
+    # disagrees with the adapter's lang_name is a foreign file, never
+    # this factory's package.
     def parse_package_filename(filename)
       grammar = @config.adapter.version_grammar_source
-      match = /\Atebako-runtime-#{Regexp.escape(@version)}-(#{grammar})-(.+?)(?:\.exe)?\z/.match(filename)
-      unless match
-        puts "::warning::Cannot infer version/platform from package filename: #{filename}"
-        return [nil, nil]
-      end
+      pattern = /\Atebako-runtime-#{Regexp.escape(@version)}-(?:([a-z0-9]+)-)?(#{grammar})-(.+?)(?:\.exe)?\z/
+      match = pattern.match(filename)
+      return warn_unparseable_name(filename) unless match
+      return [match[2], match[3]] unless foreign_lang_segment?(match[1])
 
-      [match[1], match[2]]
+      warn_foreign_segment(filename, match[1])
+    end
+
+    # The optional language capture vs the adapter's declaration.
+    def foreign_lang_segment?(lang)
+      lang && @config.adapter.lang_name && lang != @config.adapter.lang_name
+    end
+
+    def warn_unparseable_name(filename)
+      puts "::warning::Cannot infer version/platform from package filename: #{filename}"
+      [nil, nil]
+    end
+
+    def warn_foreign_segment(filename, lang)
+      puts "::warning::package filename carries a foreign language segment " \
+           "(#{lang}, this factory is #{@config.adapter.lang_name}): #{filename}"
+      [nil, nil]
     end
 
     # The upload retry budget: escalating delays, ~4.5 minutes of patience.

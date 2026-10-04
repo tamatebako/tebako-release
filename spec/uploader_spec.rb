@@ -288,6 +288,12 @@ RSpec.describe TebakoRelease::Uploader do
                YAML.dump(contract))
   end
 
+  def lang_config
+    TebakoRelease::Config.new(repo: "tamatebako/tebako-runtime-ruby", language: "ruby",
+                              adapter: LangSpecAdapter.new,
+                              contract_yml: File.join(REPO_ROOT, "spec", "fixtures", "contract.yml"))
+  end
+
   def with_packages(&block)
     Dir.chdir(@dir, &block)
   end
@@ -548,6 +554,24 @@ RSpec.describe TebakoRelease::Uploader do
   it "still warns about missing expected packages" do
     expect { manager.report_missing_packages([]) }
       .to output(/Missing runtime package: tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64/).to_stdout
+  end
+
+  # tebako#716: the post-#716 spelling carries the language segment;
+  # the pre-#716 spelling (immutable published releases) keeps parsing.
+  it "composes the language segment into expected names when the adapter declares it" do
+    lang_manager = described_class.new(config: lang_config)
+    expect { lang_manager.report_missing_packages([]) }
+      .to output(/Missing runtime package: tebako-runtime-#{SPEC_VERSION}-ruby-3\.3\.7-macos-arm64/).to_stdout
+  end
+
+  it "parses both filename eras and refuses a foreign language segment" do
+    lang_manager = described_class.new(config: lang_config)
+    expect(lang_manager.parse_package_filename("tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64"))
+      .to eq(["3.3.7", "macos-arm64"])
+    expect(lang_manager.parse_package_filename("tebako-runtime-#{SPEC_VERSION}-ruby-3.3.7-macos-arm64.exe"))
+      .to eq(["3.3.7", "macos-arm64"])
+    expect(lang_manager.parse_package_filename("tebako-runtime-#{SPEC_VERSION}-python-3.3.7-macos-arm64"))
+      .to eq([nil, nil])
   end
 
   it "reads the prepare job's object-shaped ruby matrix rows ({version, src_sha256})" do
