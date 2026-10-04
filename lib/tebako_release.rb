@@ -11,6 +11,7 @@ require_relative "tebako_release/config"
 require_relative "tebako_release/platform"
 require_relative "tebako_release/bundler"
 require_relative "tebako_release/blksum"
+require_relative "tebako_release/convergence"
 require_relative "tebako_release/uploader"
 require_relative "tebako_release/signer"
 

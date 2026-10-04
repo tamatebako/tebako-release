@@ -17,11 +17,15 @@ SignSpecRelease = Struct.new(:url, :tag_name)
 # The Octokit stand-in: release listings per release URL, uploads and
 # deletes recorded AND reflected in the listing (an uploaded .asc joins
 # the assets with the digest of its bytes, so the convergence poll sees
-# exactly what the real edge would).
+# exactly what the real edge would). Transient/quota failures are
+# scriptable per call (fail_next), and a delete can be made to lag the
+# single-asset read path by delete_propagation polls — the 0.16.32 smoke
+# night's authoritative-store lag (tebako-release#12).
 class FakeSignClient
-  attr_reader :uploads, :deletes, :tags
+  attr_reader :uploads, :deletes, :tags, :attempts
+  attr_accessor :delete_propagation
 
-  def initialize(release:, assets:, tool_release:, tool_assets:)
+  def initialize(release:, assets:, tool_release:, tool_assets:) # rubocop:disable Metrics/MethodLength
     @release = release
     @assets = assets
     @tool_release = tool_release
@@ -29,33 +33,80 @@ class FakeSignClient
     @uploads = []
     @deletes = []
     @tags = []
+    @delete_propagation = 0
+    @pending_deletes = {}
+    @attempts = Hash.new(0)
+    @failures = Hash.new { |hash, key| hash[key] = [] }
+  end
+
+  def fail_next(call, error)
+    @failures[call] << error
+  end
+
+  def attempt(call)
+    @attempts[call] += 1
+    raise @failures[call].shift unless @failures[call].empty?
   end
 
   def release_for_tag(_repo, tag)
+    attempt(:release_for_tag)
     @tags << tag
     @release
   end
 
   def latest_release(_repo)
+    attempt(:latest_release)
     @tool_release
   end
 
   def release_assets(url)
+    attempt(:release_assets)
     url == @release.url ? @assets : @tool_assets
   end
 
-  def delete_release_asset(id)
-    @deletes << id
-    @assets.reject! { |asset| asset.id == id }
+  # The single-asset existence/digest read the convergence poll rides.
+  # A freshly deleted asset keeps answering for delete_propagation polls
+  # (the delete has not propagated to the authoritative store), then 404s.
+  def release_asset(url)
+    attempt(:release_asset)
+    tick_pending_deletes
+    asset = @assets.find { |candidate| candidate.url == url } || @pending_deletes[url]&.first
+    raise Octokit::NotFound unless asset
+
+    asset
   end
 
-  def upload_asset(_url, path, content_type:, name:)
+  def delete_release_asset(id)
+    attempt(:delete)
+    @deletes << id
+    asset = @assets.find { |candidate| candidate.id == id }
+    @assets.delete(asset)
+    @pending_deletes[asset.url] = [asset, delete_propagation] if asset && delete_propagation.positive?
+  end
+
+  def upload_asset(_url, path, content_type:, name:) # rubocop:disable Metrics/MethodLength
+    attempt(:upload)
+    # A same-name upload while the deleted predecessor still answers the
+    # single-asset read 422s, exactly like the real API.
+    if @assets.any? { |asset| asset.name == name } || @pending_deletes.key?("u/#{name}")
+      raise Octokit::UnprocessableEntity.new(status: 422,
+                                             body: "Validation Failed: the asset name already_exists",
+                                             response_headers: {})
+    end
+
     @uploads << { name: name, content_type: content_type }
     asset = SignSpecAsset.new(@assets.map(&:id).max + 1, name,
                               "sha256:#{Digest::SHA256.file(path).hexdigest}",
                               Time.now, "u/#{name}")
     @assets << asset
     asset
+  end
+
+  private
+
+  def tick_pending_deletes
+    @pending_deletes.each_value { |pending| pending[1] -= 1 }
+    @pending_deletes.delete_if { |_url, (_asset, ttl)| ttl.negative? }
   end
 end
 
@@ -65,14 +116,17 @@ end
 # signing path can pass honestly); `tebako-pkg sign` writes the .asc the
 # way the real tool does; `tebako-pkg verify` succeeds. `unserved:` maps a
 # pattern to the number of "no assets to download" failures it raises
-# before serving — the young-release-object lag, exactly as gh words it.
+# before serving — the young-release-object lag, exactly as gh words it;
+# `unfound:` does the same for "release not found" — the fresh release
+# object not yet visible on gh's read path (tebako-release#13).
 class FakeSignExecutor
   attr_reader :calls
 
-  def initialize(tool_sha_ok: true, unserved: {})
+  def initialize(tool_sha_ok: true, unserved: {}, unfound: {})
     @calls = []
     @tool_sha_ok = tool_sha_ok
     @unserved = unserved
+    @unfound = unfound
   end
 
   def run(*argv, chdir: ".")
@@ -100,14 +154,22 @@ class FakeSignExecutor
   end
 
   # A lagging pattern raises the real gh wording until its budget is spent,
-  # then serves — the signer's re-ask loop is what's under test.
-  def lag_or_materialize(argv)
+  # then serves — the signer's re-ask loop is what's under test. `unfound`
+  # is the same lag one hop earlier: the fresh release object itself is not
+  # on gh's read path yet, so EVERY pattern on it answers "release not found".
+  def lag_or_materialize(argv) # rubocop:disable Metrics/MethodLength
     patterns = patterns_from(argv)
     lagging = patterns.find { |name| @unserved[name].to_i.positive? }
     if lagging
       @unserved[lagging] -= 1
       raise TebakoRelease::Signer::SigningGateError,
             "NAMED FAILURE: `gh release download vX --pattern #{lagging} --clobber` exited 1: no assets to download"
+    end
+    unfound = patterns.find { |name| @unfound[name].to_i.positive? }
+    if unfound
+      @unfound[unfound] -= 1
+      raise TebakoRelease::Signer::SigningGateError,
+            "NAMED FAILURE: `gh release download vX --pattern #{unfound} --clobber` exited 1: release not found"
     end
     materialize_download(argv)
   end
@@ -150,6 +212,12 @@ RSpec.describe TebakoRelease::Signer do
     client = FakeSignClient.new(release: release, assets: assets,
                                 tool_release: tool_release, tool_assets: tool_assets)
     [TebakoRelease::Signer.new(client: client, executor: executor, env: env), client, executor]
+  end
+
+  # A quota-shaped 403, the way Octokit 7 raises it (the rate-limit body
+  # wording maps to TooManyRequests); headers carry the window's advice.
+  def too_many_requests(headers = {})
+    Octokit::TooManyRequests.new(status: 403, body: "API rate limit exceeded", response_headers: headers)
   end
 
   it "is a quiet no-op when the gate is disarmed (unsigned stays first-class)" do
@@ -238,6 +306,8 @@ RSpec.describe TebakoRelease::Signer do
               asset(3, "pkg-b", new), asset(4, "pkg-b.asc", old),
               asset(5, "pkg-b.sha256", new), asset(6, "pkg-b.manifest.json", new)]
     signer, client, executor = signer_for(assets)
+    # The deleted stale .asc pays the name-release grace — stub the clock.
+    allow(signer).to receive(:sleep)
 
     expect(signer.sign_release).to eq(:signed)
 
@@ -392,6 +462,123 @@ RSpec.describe TebakoRelease::Signer do
     signer = TebakoRelease::Signer.new(client: client, executor: FakeSignExecutor.new, env: enabled_env)
     expect { signer.sign_release }
       .to raise_error(TebakoRelease::Signer::SigningGateError, /did not converge/)
+  end
+
+  it "rides a quota 403 out on a release-assets listing instead of dying mid-pass (tebako-release#14)" do
+    stub_const("TebakoRelease::Signer::CONVERGENCE_DELAYS", [0, 0, 0])
+    new = Time.utc(2026, 9, 9)
+    signer, client, = signer_for([asset(1, "pkg-quota", new)])
+    allow(signer).to receive(:sleep)
+    client.fail_next(:release_assets, too_many_requests("retry-after" => "1"))
+
+    expect(signer.sign_release).to eq(:signed)
+
+    # The failed listing re-asked inside the wrapper: tool listing (403 +
+    # retry) + pass-start + coverage.
+    expect(client.attempts[:release_assets]).to eq(4)
+  end
+
+  it "converges on a release object a concurrent leg just created (read-after-create visibility)" do
+    stub_const("TebakoRelease::Signer::CONVERGENCE_DELAYS", [0, 0, 0])
+    stub_const("TebakoRelease::Convergence::RELEASE_VISIBILITY_DELAYS", [0, 0, 0])
+    new = Time.utc(2026, 9, 9)
+    signer, client, = signer_for([asset(1, "pkg-fresh", new)])
+    allow(signer).to receive(:sleep)
+    2.times { client.fail_next(:release_for_tag, Octokit::NotFound.new) }
+
+    expect(signer.sign_release).to eq(:signed)
+
+    expect(client.attempts[:release_for_tag]).to eq(3)
+  end
+
+  it "re-asks a download while gh's read path has not found the fresh release object (tebako-release#13)" do
+    stub_const("TebakoRelease::Signer::CONVERGENCE_DELAYS", [0, 0, 0])
+    stub_const("TebakoRelease::Signer::SERVED_BYTES_DELAYS", [0, 0, 0])
+    new = Time.utc(2026, 9, 9)
+    executor = FakeSignExecutor.new(unfound: { "pkg-fresh" => 2 })
+    signer, = signer_for([asset(1, "pkg-fresh", new)], executor: executor)
+
+    expect(signer.sign_release).to eq(:signed)
+
+    expect(executor.sign_calls).to eq(["pkg-fresh"])
+    expect(executor.download_patterns.count("pkg-fresh")).to eq(3)
+  end
+
+  it "waits for the delete to leave the single-asset read path before re-uploading (tebako-release#12)" do
+    stub_const("TebakoRelease::Signer::CONVERGENCE_DELAYS", [0, 0, 0])
+    old = Time.utc(2026, 9, 1)
+    new = Time.utc(2026, 9, 9)
+    signer, client, = signer_for([asset(1, "pkg-b", new), asset(4, "pkg-b.asc", old)])
+    client.delete_propagation = 2
+    sleeps = []
+    allow(signer).to receive(:sleep) { |pause| sleeps << pause }
+
+    expect(signer.sign_release).to eq(:signed)
+
+    expect(client.deletes).to eq([4])
+    # Two polls at the propagation interval while the delete lags, the
+    # name-release grace after the visible absence, then the cycle pause.
+    expect(sleeps).to eq([2, 2, 15, 0])
+  end
+
+  it "fails fast and named when the delete never propagates (a resumable red beats a wedge)" do
+    stub_const("TebakoRelease::Signer::CONVERGENCE_DELAYS", [0, 0, 0])
+    old = Time.utc(2026, 9, 1)
+    new = Time.utc(2026, 9, 9)
+    signer, client, = signer_for([asset(1, "pkg-b", new), asset(4, "pkg-b.asc", old)])
+    client.delete_propagation = 999
+    allow(signer).to receive(:sleep)
+    now = 0.0
+    allow(signer).to receive(:monotonic_now) { now += 200 }
+
+    expect { signer.sign_release }
+      .to raise_error(TebakoRelease::Signer::SigningGateError, /has not propagated/)
+  end
+
+  it "rides the 422 already_exists race by re-learning the record and cycling" do
+    stub_const("TebakoRelease::Signer::CONVERGENCE_DELAYS", [0, 0, 0])
+    new = Time.utc(2026, 9, 9)
+    signer, client, = signer_for([asset(1, "pkg-race", new)])
+    allow(signer).to receive(:sleep)
+    client.fail_next(:upload, Octokit::UnprocessableEntity.new(status: 422,
+                                                               body: "Validation Failed: the asset name already_exists",
+                                                               response_headers: {}))
+
+    expect(signer.sign_release).to eq(:signed)
+
+    expect(client.attempts[:upload]).to eq(2)
+  end
+
+  it "fails fast and named on a 422 that is not the deletion-propagation race" do
+    stub_const("TebakoRelease::Signer::CONVERGENCE_DELAYS", [0, 0, 0])
+    new = Time.utc(2026, 9, 9)
+    signer, client, = signer_for([asset(1, "pkg-bad", new)])
+    allow(signer).to receive(:sleep)
+    client.fail_next(:upload, Octokit::UnprocessableEntity.new(status: 422,
+                                                               body: "Validation Failed: file too large",
+                                                               response_headers: {}))
+
+    expect { signer.sign_release }
+      .to raise_error(TebakoRelease::Signer::SigningGateError, /not the deletion-propagation race/)
+
+    expect(client.attempts[:upload]).to eq(1)
+  end
+
+  it "keeps the pass's request shape inside the single-asset budget (tebako-release#14)" do
+    stub_const("TebakoRelease::Signer::CONVERGENCE_DELAYS", [0, 0, 0])
+    new = Time.utc(2026, 9, 9)
+    signer, client, = signer_for([asset(1, "pkg-x", new), asset(2, "pkg-y", new)])
+
+    expect(signer.sign_release).to eq(:signed)
+
+    # The full listings: the tool release, the pass-start, the coverage
+    # assertion — never a re-listing per convergence cycle.
+    expect(client.attempts[:release_assets]).to eq(3)
+    # The convergence polls ride the single-asset endpoint, one per cycle.
+    expect(client.attempts[:release_asset]).to eq(2)
+    # Two signed targets, nine requests in total — the catalog fleet's
+    # ~90 legs stay far inside the token's 5,000/h window.
+    expect(client.attempts.values.sum).to eq(9)
   end
 
   it "budgets the convergence window for campaign-scale concurrency (tebako-release#15)" do

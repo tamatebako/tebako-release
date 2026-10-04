@@ -65,6 +65,12 @@ module TebakoRelease
   # declared through TebakoRelease.configure (or TEBAKO_RELEASE_REPO),
   # never by editing a copy.
   class Signer # rubocop:disable Metrics/ClassLength
+    # Every GitHub call below rides the shared convergence wrapper (quota
+    # ride-outs, transient retries, the release-visibility and
+    # deletion-propagation budgets) — tebako-release#14's sign legs died
+    # on terminal 403s mid-convergence; no call escapes the wrapper now.
+    include Convergence
+
     # Armed-but-cannot, provenance, and coverage failures: the pass never
     # ships a partially signed release silently.
     class SigningGateError < StandardError; end
@@ -97,6 +103,16 @@ module TebakoRelease
     # "no assets"); bounded re-asks, then the named failure stands.
     SERVED_BYTES_DELAYS = [5, 10, 20, 40, 80].freeze
 
+    # The young-release wordings the download re-ask loop retries (the
+    # operation class b): the name came FROM the release listing (or the
+    # leg just published it), so gh's "no assets to download" — and a fresh
+    # release object's own "release not found" (the 2026-10-02/03
+    # force_rebuild's sidecar-fetch deaths, tebako-release#13) — are the
+    # read path trailing the write, never absence. Every other named
+    # failure (auth, usage, a genuinely gone release past the budget)
+    # raises at once.
+    YOUNG_RELEASE_WORDINGS = ["no assets to download", "release not found"].freeze
+
     def initialize(client: nil, executor: nil, env: ENV, config: nil)
       @env = env
       @config = config || TebakoRelease.config
@@ -123,7 +139,7 @@ module TebakoRelease
         work = Pathname.new(dir)
         tool = fetch_verified_tool(work)
         key_file = materialize_key(work)
-        assets = @client.release_assets(release.url)
+        assets = with_transient_retries("release assets") { @client.release_assets(release.url) }
         targets = signature_targets(assets.map(&:name))
         stale = stale_targets(targets, assets)
         puts "#{@tag}: #{targets.size} signature targets, #{stale.size} need (re)signing"
@@ -136,7 +152,7 @@ module TebakoRelease
                   "signing needs the listing's sha256 to prove the signed bytes are the served bytes"
           end
 
-          sign_one(work, key_file, tool, release, name, digest)
+          sign_one(work, key_file, tool, release, name, digest, by_name["#{name}.asc"])
         end
         assert_coverage!(release, targets)
       end
@@ -207,9 +223,30 @@ module TebakoRelease
       /\Atebako-pkg-\d+\.\d+\.\d+-#{Regexp.escape(tool_host_id)}#{Regexp.escape(suffix)}\z/
     end
 
+    # Read-after-create convergence (the operation class b): on a fresh
+    # per-line release object a sign leg can schedule AHEAD of the publish
+    # leg's create becoming readable — the 2026-10-02/03 force_rebuild
+    # fan-out died on exactly this. Poll for visibility on the bounded
+    # budget (each poll rides the wrapper, so a quota burst stretches the
+    # wait inside the call), then the named failure stands.
     def find_release
-      @client.release_for_tag(@config.repo, @tag)
+      find_release_once || await_release_visibility
+    end
+
+    def find_release_once
+      with_transient_retries("release for tag #{@tag}") { @client.release_for_tag(@config.repo, @tag) }
     rescue Octokit::NotFound
+      nil
+    end
+
+    def await_release_visibility
+      RELEASE_VISIBILITY_DELAYS.each do |pause|
+        puts "#{@tag}: the release object is not visible yet (a concurrent leg just created it) — " \
+             "re-asking in #{pause}s"
+        sleep pause
+        release = find_release_once
+        return release if release
+      end
       raise SigningGateError, "NAMED FAILURE: no release found for tag #{@tag} — nothing to sign"
     end
 
@@ -234,8 +271,10 @@ module TebakoRelease
     # provenance-pinned: downloaded with its .sha256 sidecar and executed
     # only when the digest matches.
     def fetch_verified_tool(work) # rubocop:disable Metrics/AbcSize, Metrics/MethodLength
-      latest = @client.latest_release(@config.tool_repo)
-      names = @client.release_assets(latest.url).map(&:name)
+      latest = with_transient_retries("latest #{@config.tool_repo} release") do
+        @client.latest_release(@config.tool_repo)
+      end
+      names = with_transient_retries("tool release assets") { @client.release_assets(latest.url) }.map(&:name)
       tool_name = names.find { |name| name.match?(tool_asset_pattern) }
       unless tool_name
         raise SigningGateError,
@@ -265,7 +304,7 @@ module TebakoRelease
     # verify against the freshly registered key, then converge the .asc onto
     # the release. The digest is the no-fold rule's provenance: the signed
     # bytes are provably the bytes the release serves.
-    def sign_one(work, key_file, tool, release, name, digest) # rubocop:disable Metrics/AbcSize, Metrics/ParameterLists
+    def sign_one(work, key_file, tool, release, name, digest, existing_asc) # rubocop:disable Metrics/AbcSize, Metrics/ParameterLists
       local = Pathname.new(local_packages_dir).join(name)
       target = if local.exist? && Digest::SHA256.file(local).hexdigest == digest
                  local
@@ -274,7 +313,7 @@ module TebakoRelease
                end
       @executor.run(tool, "sign", "--key-file", key_file.to_s, "--no-sums", name, chdir: File.dirname(target.to_s))
       @executor.run(tool, "verify", name, chdir: File.dirname(target.to_s))
-      converge_asc(release, Pathname.new(File.join(File.dirname(target.to_s), "#{name}.asc")))
+      converge_asc(release, Pathname.new(File.join(File.dirname(target.to_s), "#{name}.asc")), existing_asc)
       puts "#{name}: signed and converged"
     end
 
@@ -293,32 +332,40 @@ module TebakoRelease
             "#{name} downloaded with sha256 #{actual}, the listing says #{digest}"
     end
 
-    # The bounded re-ask for the young-release-object lag: the name came FROM
-    # the release listing, so gh's "no assets to download" is the byte store
-    # trailing the listing, never absence — it retries; every other named
-    # failure (auth, usage, a genuinely gone release) raises at once.
+    # The bounded re-ask for the young-release-object lag: the wordings
+    # above retry; everything else raises at once.
     def download_when_served(dir, name)
       pauses = SERVED_BYTES_DELAYS.dup
       begin
         @executor.run("gh", "release", "download", @tag, "--repo", @config.repo,
                       "--pattern", name, "--dir", dir.to_s, "--clobber")
       rescue SigningGateError => e
-        raise unless e.message.include?("no assets to download") && (pause = pauses.shift)
+        raise unless young_release_failure?(e) && (pause = pauses.shift)
 
-        puts "#{name} is listed but not served yet (young release object) — re-asking in #{pause}s"
+        puts "#{name}: the release read path has not converged on the fresh object yet — re-asking in #{pause}s"
         sleep pause
         retry
       end
     end
 
+    def young_release_failure?(error)
+      YOUNG_RELEASE_WORDINGS.any? { |wording| error.message.include?(wording) }
+    end
+
     # A tiny metadata upload, converged: replace whatever the name serves,
-    # then poll until the listing's digest is our bytes (the edge cache
-    # lesson of the uploader, bounded).
-    def converge_asc(release, asc_file)
+    # then poll until the served record's digest is our bytes. The poll
+    # rides the SINGLE-ASSET endpoint (one request per cycle — never a
+    # re-paginated listing: at catalog size the full listing is ~5 pages,
+    # and ~90 legs polling it every cycle is what drained the shared
+    # token's hourly budget mid-fleet, tebako-release#14). The held record
+    # flows between cycles: the pass-start listing's stale record first,
+    # then each upload's landed record.
+    def converge_asc(release, asc_file, existing) # rubocop:disable Metrics/MethodLength
       sha = Digest::SHA256.file(asc_file).hexdigest
+      asset = existing
       converged = false
       CONVERGENCE_DELAYS.each do |pause|
-        converged = asc_converged?(release, asc_file, sha)
+        converged, asset = converge_asc_cycle(release, asc_file, sha, asset)
         break if converged
 
         wait = Signer.jittered(pause)
@@ -328,30 +375,94 @@ module TebakoRelease
       raise SigningGateError, "NAMED FAILURE: #{asc_file.basename} did not converge on #{@tag}" unless converged
     end
 
-    # One convergence cycle: the listing already serving our bytes is done;
-    # anything else is deleted/replaced and re-uploaded for the next poll.
-    # A 422 mid-replace is the deletion-propagation race (the wedge
-    # lesson): the name unblocks within a cycle, so it rides along as
-    # not-yet-converged instead of crashing the pass.
-    def asc_converged?(release, asc_file, sha) # rubocop:disable Metrics/AbcSize
-      existing = @client.release_assets(release.url).find { |asset| asset.name == asc_file.basename.to_s }
-      return true if existing && listed_sha(existing) == sha
+    # One convergence cycle: the held record already serving our bytes is
+    # done; a stale record is deleted — its absence awaited on the same
+    # single-asset endpoint before the re-upload (the delete-then-upload
+    # class, tebako-release#12's wedge lesson) — and the upload's fresh
+    # record feeds the next cycle's poll. A 422 mid-replace carrying
+    # already_exists is the deletion-propagation race (or a concurrent
+    # leg's landed upload): re-list ONCE to learn the conflicting record,
+    # then ride it as not-yet-converged. Any other 422 is a validation
+    # error, not the race — fail fast and named, never grind.
+    # Returns [converged, record-to-hold].
+    def converge_asc_cycle(release, asc_file, sha, asset) # rubocop:disable Metrics/MethodLength, Metrics/AbcSize, Metrics/CyclomaticComplexity
+      name = asc_file.basename.to_s
+      digest = asset && served_sha(asset, name)
+      return [true, asset] if digest == sha
 
-      @client.delete_release_asset(existing.id) if existing
-      @client.upload_asset(release.url, asc_file.to_s,
-                           content_type: "text/plain",
-                           name: asc_file.basename.to_s)
-      false
+      asset = nil if asset && digest.nil? # the held record left the store — the name is free
+      if asset
+        with_transient_retries("delete #{name}") { @client.delete_release_asset(asset.id) }
+        await_asc_absence(asset, name)
+      end
+      asset = with_transient_retries("upload #{name}") do
+        @client.upload_asset(release.url, asc_file.to_s,
+                             content_type: "text/plain",
+                             name: name)
+      end
+      [false, asset]
     rescue Octokit::UnprocessableEntity => e
-      puts "#{asc_file.basename}: replace raced the 422 propagation window (#{e.class}) — cycling"
+      unless e.message.include?("already_exists")
+        raise SigningGateError,
+              "NAMED FAILURE: the #{name} upload was rejected (#{e.message}) — not the deletion-propagation " \
+              "race; refusing to grind on a validation error"
+      end
+      puts "#{name}: replace raced the 422 propagation window (#{e.class}) — cycling"
+      [false, find_asc_asset(release, name)]
+    end
+
+    # The record's currently-served digest, read on the single-asset
+    # endpoint; nil when the record is gone (our delete propagated, or it
+    # never committed).
+    def served_sha(asset, name)
+      record = with_transient_retries("asset #{name} state") { @client.release_asset(asset.url) }
+      listed_sha(record)
+    rescue Octokit::NotFound
+      nil
+    end
+
+    # The delete is visible only when the single-asset read 404s — the
+    # listing flaps independently of the authoritative store (#12's night),
+    # so the listing is never probed here. Over the deadline the leg fails
+    # fast and named: a resumable red beats a job-timeout wedge.
+    def await_asc_absence(asset, name) # rubocop:disable Metrics/MethodLength
+      deadline = monotonic_now + DELETION_PROPAGATION_DEADLINE
+      until asc_absent?(asset)
+        if monotonic_now >= deadline
+          raise SigningGateError,
+                "NAMED FAILURE: the deletion of #{name} has not propagated within " \
+                "#{DELETION_PROPAGATION_DEADLINE}s — the asset name stays 422-blocked server-side; " \
+                "re-run the sign leg"
+        end
+
+        puts "Waiting for the deletion of #{name} to propagate..."
+        sleep DELETION_PROPAGATION_POLL_INTERVAL
+      end
+      puts "#{name} left the listing; giving the name #{DELETION_PROPAGATION_GRACE}s to free up server-side"
+      sleep DELETION_PROPAGATION_GRACE
+    end
+
+    def asc_absent?(asset)
+      with_transient_retries("asset #{asset.id} existence") { @client.release_asset(asset.url) }
       false
+    rescue Octokit::NotFound
+      true
+    end
+
+    # The recovery read behind a raced 422: ONE re-listing to learn the
+    # conflicting record (our own lagging delete or a concurrent leg's
+    # landed upload) so the next cycle's poll rides the single-asset
+    # endpoint again.
+    def find_asc_asset(release, name)
+      with_transient_retries("release assets") { @client.release_assets(release.url) }
+        .find { |asset| asset.name == name }
     end
 
     # The coverage assertion: after the pass, every target has a .asc on
     # the release — a partially signed release is a named failure, never a
     # quiet state.
     def assert_coverage!(release, targets)
-      names = @client.release_assets(release.url).map(&:name)
+      names = with_transient_retries("release assets") { @client.release_assets(release.url) }.map(&:name)
       missing = targets.reject { |name| names.include?("#{name}.asc") }
       return if missing.empty?
 

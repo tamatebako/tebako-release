@@ -77,3 +77,25 @@ the 422 wedge; tebako-runtime-ruby#189). A forced republication recreates the
 (`gh release delete <tag> --cleanup-tag false` … the first leg's
 race-safe create re-makes it), turning every leg's publish into pure creates.
 Operator-run re-uploads follow the same rule by hand.
+
+## Convergence and rate-limit discipline
+
+Every GitHub API call in the gem rides one internal wrapper
+(`TebakoRelease::Convergence`), with per-operation-class semantics.
+Unconditional calls (plain reads, idempotent writes) ride quota responses
+out: a 403/429 rate-limit answer is never fatal — the wrapper sleeps to the
+response's named window (`x-ratelimit-reset`, else `Retry-After`), or backs
+off exponentially from 30 s up to a 10-minute cap when the response names no
+window — and transport drops retry with escalating waits. Read-after-create
+calls poll for the fresh release object's visibility on a bounded delay
+list; delete-then-upload replaces poll the single-asset endpoint until the
+deletion is visibly absent (plus a short name-release grace) before
+re-uploading, so the 422 propagation race never wedges a leg. The patience
+is bounded twice — eight absorbed quota responses per call, and a two-window
+(~2 h) wall-clock ceiling per process — and then the leg fails with a named,
+resumable error; the metadata replace loop additionally carries a hard
+15-minute deadline. Convergence polls ride the single-asset endpoint (one
+request per poll, never a re-paginated listing), so a catalog fleet stays
+far inside the token's hourly request window. Every retry logs a stderr line
+with the attempt, the wait, and the call's target, so a ride-out is visible
+in the CI log instead of looking like a hang.
