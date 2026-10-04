@@ -45,15 +45,16 @@ module TebakoRelease
   # language version key/grammar, capability gates, DLL naming — flow
   # through the Config/Adapter.
   class Uploader # rubocop:disable Metrics/ClassLength
+    # Every GitHub call below rides the shared convergence wrapper (quota
+    # ride-outs, transient retries, the release-visibility and
+    # deletion-propagation budgets; RateLimitBudgetExhausted and the
+    # RATE_LIMIT_*/DELETION_PROPAGATION_* constants resolve from there).
+    include Convergence
+
     # Named error (spec 00: named errors, never silent fallbacks): a release
     # asset's deletion did not stop the name from being listed within the
     # propagation deadline — the name stays 422-blocked server-side.
     class DeletionPropagationTimeout < StandardError; end
-
-    # The rate-limit ride-out has a bound: two full hourly windows waited in
-    # one process means something is systemically wrong — give up loudly
-    # instead of blocking the runner forever.
-    class RateLimitBudgetExhausted < StandardError; end
 
     # The era-2 release card (spec 18 C2): every runtime package carries a
     # builder-emitted `<package>.contract.yaml` sidecar (contract_era,
@@ -232,7 +233,7 @@ module TebakoRelease
     def read_previous_manifest
       release = find_release
       asset = release && find_asset(release, "manifest.json")
-      asset && with_transient_retries { download_asset_json(asset) }
+      asset && with_transient_retries("previous manifest.json") { download_asset_json(asset) }
     end
 
     def deep_symbolize(value)
@@ -244,7 +245,7 @@ module TebakoRelease
     end
 
     def download_asset_json(asset)
-      JSON.parse(with_transient_retries { @client.get(asset.browser_download_url) }.to_s)
+      JSON.parse(with_transient_retries("download #{asset.name}") { @client.get(asset.browser_download_url) }.to_s)
     end
 
     def expected_package_names # rubocop:disable Metrics/AbcSize, Metrics/MethodLength
@@ -278,26 +279,44 @@ module TebakoRelease
     # (422s resolve by content inside perform_upload), then verify what the
     # edge serves. The loop repeats until the edge converges or the budget
     # runs out — a metadata rewrite never dies on the first bad cycle.
-    # The convergence cycle sleeps, ~46 min of patience. Tonight's backend
-    # (2026-08-03) blocked a deleted name's re-upload for 4.5+ HOURS.
     # Since the de-rendezvous (spec 13 §2a) a leg rewrites only
     # its OWN packages' shards/sidecars — every name it touches is one it
     # owns, so a convergence grind can never rendezvous with another leg;
     # an incident night is an incident night, and the legs run concurrently.
     METADATA_CONVERGENCE_DELAYS = [5, 15, 30, 60, 120, 240, 480, 600, 600, 600].freeze
 
-    def force_upload(release, file, delays: METADATA_CONVERGENCE_DELAYS)
+    # The TOTAL wall-clock bound on one replace (tebako-release#12): on a
+    # pathological backend night a deleted name never frees and every
+    # re-upload 422s — each cycle's delete-wait and backoff re-arm per
+    # iteration, so without a deadline the loop grinds into the CI job
+    # timeout (the 0.16.32 smoke burned both macos legs' full 60 minutes
+    # on one shard). Fifteen minutes covers a healthy night's propagation
+    # (the 0.16.8 wedge freed in ~15 s; 2026-08-03 took minutes); past it
+    # the replace cannot land tonight and the named error says so — a fast
+    # red leg is resumable for free, a job-timeout death is not.
+    METADATA_CONVERGENCE_DEADLINE = 900
+
+    def force_upload(release, file, delays: METADATA_CONVERGENCE_DELAYS) # rubocop:disable Metrics/AbcSize, Metrics/MethodLength
       filename = file.basename.to_s
       sha = Digest::SHA256.file(file).hexdigest
+      deadline = monotonic_now + METADATA_CONVERGENCE_DEADLINE
       converged = false
       delays.each do |pause|
         converged = metadata_converged?(release, file, filename, sha)
         break if converged
 
+        raise metadata_deadline_error(filename) if monotonic_now >= deadline
+
         puts "#{filename} has not converged on the release yet; cycling in #{pause}s"
-        sleep pause
+        sleep [pause, deadline - monotonic_now].min
       end
       raise "could not converge #{filename} on the release within the metadata budget" unless converged
+    end
+
+    def metadata_deadline_error(filename)
+      "could not converge #{filename} on the release within the #{METADATA_CONVERGENCE_DEADLINE}s " \
+        "convergence deadline — the release backend is wedged on this name tonight (an unpropagated " \
+        "delete holds it 422-blocked); re-run this leg, a healthy backend converges in one cycle"
     end
 
     # One convergence cycle: read-first (the edge already serves our bytes
@@ -353,7 +372,7 @@ module TebakoRelease
     # correct accept (content is content); absent/stale bytes only mean
     # "take the mutation path".
     def served_content(filename)
-      with_transient_retries { @client.get(download_url(filename)) }.to_s
+      with_transient_retries("served bytes #{filename}") { @client.get(download_url(filename)) }.to_s
     rescue Octokit::NotFound
       nil
     end
@@ -401,27 +420,32 @@ module TebakoRelease
     # matrix legs of one publish run race here (spec 13 §2a's
     # de-rendezvous: no leg waits on another). The loser's create 422s on
     # the taken tag; it polls for the winner's release to become visible
-    # and rides it. Creation is write-once, never a wedge.
-    RELEASE_CREATE_POLL_DELAYS = [5, 5, 5, 5, 5, 5].freeze
-
+    # and rides it (RELEASE_VISIBILITY_DELAYS — each poll rides the
+    # wrapper, so a quota burst stretches the wait inside the call instead
+    # of burning polls). Creation is write-once, never a wedge.
     def get_or_create_release # rubocop:disable Naming/AccessorMethodName
       puts "Looking for release with tag: #{@tag}"
-      @client.release_for_tag(@config.repo, @tag)
-    rescue Octokit::NotFound
-      create_release_race_safe
+      find_release || create_release_race_safe
     end
 
     # A rescue clause's own exceptions never re-enter the sibling rescues —
-    # the create's 422 handling lives in its own method.
+    # the create's 422 handling lives in its own method. The POST itself
+    # rides the wrapper: a quota response mid-fan-out (the 2026-10-03
+    # fleet's terminal `POST /releases: 403`s) sleeps the window out, and
+    # a timed-out create that LANDED server-side 422s the retry — the
+    # race-safe poll below then rides the landed release, exactly the
+    # lost-race shape.
     def create_release_race_safe # rubocop:disable Metrics/MethodLength
       puts "Creating new release for tag: #{@tag}"
-      @client.create_release(@config.repo, @tag,
-                             name: @release_title,
-                             body: release_notes)
+      with_transient_retries("create release #{@tag}") do
+        @client.create_release(@config.repo, @tag,
+                               name: @release_title,
+                               body: release_notes)
+      end
     rescue Octokit::UnprocessableEntity
       # A concurrent leg won the create. Poll for its release to become
       # visible, then ride it — never re-attempt the create.
-      RELEASE_CREATE_POLL_DELAYS.each do |pause|
+      RELEASE_VISIBILITY_DELAYS.each do |pause|
         sleep pause
         release = find_release
         return release if release
@@ -433,7 +457,7 @@ module TebakoRelease
     # The read-only lookup (the previous-entry reads + the audit read the
     # existing release): nil when the tag has no release, never creates one.
     def find_release
-      with_transient_retries { @client.release_for_tag(@config.repo, @tag) }
+      with_transient_retries("release for tag #{@tag}") { @client.release_for_tag(@config.repo, @tag) }
     rescue Octokit::NotFound
       nil
     end
@@ -765,7 +789,7 @@ module TebakoRelease
       end
 
       puts "#{filename}: the landed asset's content disagrees — deleting the partial/stale asset before the retry"
-      with_transient_retries { @client.delete_release_asset(asset.id) }
+      with_transient_retries("delete #{filename}") { @client.delete_release_asset(asset.id) }
       drop_asset_from_memo(asset.id) # the deleted asset leaves the listing
       # The name stays 422-blocked until the delete propagates — poll for
       # the absence so the retry's POST actually lands (the v0.16.3 gnu
@@ -813,7 +837,7 @@ module TebakoRelease
 
     def landed_content(release, filename)
       asset = find_asset(release, filename)
-      return with_transient_retries { @client.get(asset.browser_download_url) }.to_s if asset
+      return with_transient_retries("download #{filename}") { @client.get(asset.browser_download_url) }.to_s if asset
 
       served_content(filename)
     rescue Octokit::NotFound
@@ -831,7 +855,7 @@ module TebakoRelease
     # 2026-08-30) stay with perform_upload (escalating delays, 422-by-content
     # resolution, the per-asset budget) — ONE retry layer, not two.
     def upload_once(release, package, filename)
-      asset = with_rate_limit_rideout do
+      asset = with_rate_limit_rideout("upload #{filename}") do
         @client.upload_asset(release.url, package.to_s,
                              content_type: "application/octet-stream",
                              name: filename)
@@ -1118,7 +1142,8 @@ module TebakoRelease
     end
 
     def download_shard_entry(asset)
-      deep_symbolize(JSON.parse(with_transient_retries { @client.get(asset.browser_download_url) }.to_s))
+      body = with_transient_retries("shard #{asset.name}") { @client.get(asset.browser_download_url) }.to_s
+      deep_symbolize(JSON.parse(body))
     end
 
     # The package stems a set of entries covers (exe + .tfs/.dll facets).
@@ -1413,35 +1438,19 @@ module TebakoRelease
       existing = find_asset(release, filename)
       return unless existing
 
-      with_transient_retries { @client.delete_release_asset(existing.id) }
+      with_transient_retries("delete #{filename}") { @client.delete_release_asset(existing.id) }
       drop_asset_from_memo(existing.id) # the deleted asset leaves the listing
       wait_for_absence_best_effort(release, filename, existing)
     end
 
     # GitHub asset deletion is only eventually consistent: a same-name
-    # re-upload 422s until the delete propagates (the v0.16.1 windows
-    # publish lost SHA256SUMS.txt to exactly this — four retries inside
-    # ~20 s never saw the absence). Poll for the absence, SLEEPING between
-    # polls, under an overall wall-clock deadline; when propagation outlasts
-    # the deadline the named error fires — the wait never spins and never
-    # silently gives up (the 2026-08-20 publish burned its whole job timeout
-    # on a wait whose outcome nobody could act on).
-    # The deadline matches the OBSERVED propagation window: the 2026-08-29
-    # publish watched a deleted name stay 422-blocked well past the old
-    # 60 s — past the per-asset 300 s budget once. Three minutes of polling
-    # (single-asset reads, never a re-listing) covers the incident class; a
-    # name still held after that is wedged, and the caller's
-    # retry/convergence budget rides it out.
-    DELETION_PROPAGATION_POLL_INTERVAL = 2
-    DELETION_PROPAGATION_DEADLINE = 180
-    # The listing's truth frees the name BEFORE the upload validator's
-    # replica does: on the 0.16.8 publish a same-name POST kept 422ing
-    # (Validation Failed / code: already_exists / field: name) ~15 s PAST
-    # the deletion's visible absence — the manual repair that worked was
-    # "gone, grace, then upload". Every confirmed absence pays this grace
-    # before the next POST.
-    DELETION_PROPAGATION_GRACE = 15
-
+    # re-upload 422s until the delete propagates. Poll for the absence,
+    # SLEEPING between polls, under an overall wall-clock deadline; when
+    # propagation outlasts the deadline the named error fires — the wait
+    # never spins and never silently gives up (the 2026-08-20 publish
+    # burned its whole job timeout on a wait whose outcome nobody could
+    # act on). The poll interval, deadline, and grace constants live in
+    # Convergence — the signer shares the discipline.
     def wait_for_absence(release, filename, asset, deadline: DELETION_PROPAGATION_DEADLINE) # rubocop:disable Metrics/MethodLength
       started = monotonic_now
       loop do
@@ -1474,7 +1483,9 @@ module TebakoRelease
     # request window mid-publish. The real API always hands listed assets an
     # api url; the fallback rebuilds it from the release url.
     def asset_deleted?(release, asset)
-      with_transient_retries { @client.release_asset(asset.url || "#{release.url}/assets/#{asset.id}") }
+      with_transient_retries("asset #{asset.id} existence") do
+        @client.release_asset(asset.url || "#{release.url}/assets/#{asset.id}")
+      end
       false
     rescue Octokit::NotFound
       true
@@ -1490,12 +1501,6 @@ module TebakoRelease
       puts "::warning::#{e.message}"
     end
 
-    # Wall-clock reads for the deadline accounting — monotonic, immune to
-    # clock smear on the runner.
-    def monotonic_now
-      Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    end
-
     # release.assets is an embedded array capped at 30 entries, and a raw
     # rels[:assets].get is NOT auto-paginated either (auto_paginate covers
     # client methods, not Sawyer rel gets) — with 100+ assets most lookups
@@ -1509,10 +1514,10 @@ module TebakoRelease
     # exist within a run.
     def all_assets(release)
       @all_assets ||= begin
-        page = with_transient_retries { release.rels[:assets].get }
+        page = with_transient_retries("asset listing") { release.rels[:assets].get }
         assets = page.data
         while (nxt = page.rels[:next])
-          page = with_transient_retries { nxt.get }
+          page = with_transient_retries("asset listing page") { nxt.get }
           assets += page.data
         end
         assets
@@ -1531,89 +1536,6 @@ module TebakoRelease
 
     def find_asset(release, filename)
       all_assets(release).find { |a| a.name == filename }
-    end
-
-    # GET/DELETE/PUT calls other than the asset upload share the same
-    # transient network failure modes; retry them (they are idempotent).
-    # A 403 rate-limit response is not one of those modes: it rides the
-    # window out and never consumes the transient attempts. Transport-level
-    # drops (SSL EOF, TCP reset) belong here too: a stale keep-alive
-    # connection answered with an SSL EOF is indistinguishable from a fresh
-    # one that works — net-http retries those on EOFError but NOT on
-    # OpenSSL::SSL::SSLError, so we do (the 2026-08-30 backfill crashed on
-    # exactly that, on the verification GET right after a long upload POST).
-    TRANSIENT_ERRORS = [
-      Net::WriteTimeout, Net::ReadTimeout,
-      Faraday::TimeoutError, Faraday::ConnectionFailed,
-      OpenSSL::SSL::SSLError, EOFError, SystemCallError
-    ].freeze
-
-    def with_transient_retries(attempts: 4)
-      with_rate_limit_rideout do
-        yield
-      rescue *TRANSIENT_ERRORS => e
-        attempts -= 1
-        raise if attempts <= 0
-
-        delay = (5 * (4 - attempts)) + rand(5)
-        puts "#{e.class}; retrying in #{delay}s (#{attempts} attempt(s) left)"
-        sleep delay
-        retry
-      end
-    end
-
-    # A 403 rate-limit response must never kill the publish: the uploader
-    # is one serialized actor, and sleeping until the window resets is the
-    # CORRECT behavior (the 0.16.6 publish burned the tebako-ci token's
-    # 5000-request hourly window in ~30 minutes and died at the finalize —
-    # GET .../assets 403 — after all 334 payload assets had landed). The
-    # upload POST rides this out too; its transient retries (escalating
-    # delays, 422-by-content resolution, the per-asset budget) stay with
-    # perform_upload.
-    RATE_LIMIT_SETTLE = 5
-    RATE_LIMIT_DEFAULT_WAIT = 60
-    RATE_LIMIT_BUDGET = (2 * 3600) + 300
-
-    def with_rate_limit_rideout
-      yield
-    rescue Octokit::TooManyRequests => e
-      wait = rate_limit_wait(e)
-      puts "#{e.class}; rate-limited — sleeping #{wait}s until the window resets"
-      sleep wait
-      retry
-    end
-
-    # The seconds to sleep before the next call, budget-checked: one full
-    # hourly window is a legitimate wait; a wait that would push the process
-    # past two windows means something is systemically wrong — give up
-    # loudly instead of blocking the runner forever.
-    def rate_limit_wait(error)
-      wait = rate_limit_seconds(error)
-      return wait if monotonic_now + wait <= rate_limit_deadline
-
-      raise RateLimitBudgetExhausted,
-            "the next GitHub rate-limit window is #{wait}s out but this publish has a #{RATE_LIMIT_BUDGET}s " \
-            "ride-out budget — two full windows spent; giving up loudly instead of blocking forever"
-    end
-
-    def rate_limit_deadline
-      @rate_limit_deadline ||= monotonic_now + RATE_LIMIT_BUDGET
-    end
-
-    # The reset header names the window's end as a wall-clock epoch (plus a
-    # small settle); a stale or absent reset falls back to Retry-After,
-    # then to a default minute. Faraday's real headers are case-insensitive;
-    # read both spellings so a plain hash (the spec fake) serves the same
-    # values.
-    def rate_limit_seconds(error)
-      headers = error.response_headers || {}
-      reset = (headers["x-ratelimit-reset"] || headers["X-RateLimit-Reset"]).to_i
-      return reset - Time.now.to_i + RATE_LIMIT_SETTLE if reset > Time.now.to_i
-
-      retry_after = (headers["retry-after"] || headers["Retry-After"]).to_i
-      return retry_after + RATE_LIMIT_SETTLE if retry_after.positive?
-
-      RATE_LIMIT_DEFAULT_WAIT
     end
 
     def run
@@ -1745,7 +1667,7 @@ module TebakoRelease
         raise Error, "the served image #{image_name} is not on the release — cannot derive its blksum sidecar"
       end
 
-      bytes = with_transient_retries { @client.get(asset.browser_download_url) }.to_s
+      bytes = with_transient_retries("download #{image_name}") { @client.get(asset.browser_download_url) }.to_s
       Pathname.new(Dir.mktmpdir).join(image_name).tap { |path| path.binwrite(bytes) }
     end
 
@@ -1790,7 +1712,8 @@ module TebakoRelease
     end
 
     def extract_bundle(_release, bundle_asset)
-      bytes = with_transient_retries { @client.get(bundle_asset.browser_download_url) }.to_s
+      url = bundle_asset.browser_download_url
+      bytes = with_transient_retries("bundle #{bundle_asset.name}") { @client.get(url) }.to_s
       dir = Pathname.new(Dir.mktmpdir("tebako-release-bundle-"))
       Zlib::GzipReader.wrap(StringIO.new(bytes)) { |gzip| extract_tar_members(bundle_asset, gzip, dir) }
     end

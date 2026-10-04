@@ -195,6 +195,7 @@ class FakeClient
   attr_reader :release
 
   def release_for_tag(_repo, _tag)
+    @store.attempt(:release_for_tag)
     @release
   end
 
@@ -292,6 +293,12 @@ RSpec.describe TebakoRelease::Uploader do
     TebakoRelease::Config.new(repo: "tamatebako/tebako-runtime-ruby", language: "ruby",
                               adapter: LangSpecAdapter.new,
                               contract_yml: File.join(REPO_ROOT, "spec", "fixtures", "contract.yml"))
+  end
+
+  # A 403 quota response in the real API's shape (octokit maps the body
+  # wording to TooManyRequests); headers carry the window's advice.
+  def too_many_requests(headers = {})
+    Octokit::TooManyRequests.new(status: 403, body: "API rate limit exceeded", response_headers: headers)
   end
 
   def with_packages(&block)
@@ -1024,6 +1031,27 @@ RSpec.describe TebakoRelease::Uploader do
       expect(store.attempts[:upload]).to eq(TebakoRelease::Uploader::UPLOAD_RETRY_DELAYS.size + 1)
     end
 
+    # tebako-release#12 (the 0.16.32 smoke's 45-minute shard 422 loop):
+    # the convergence cadence re-arms per cycle, so the TOTAL wall-clock
+    # deadline is what ends a pathological night — fast, named, resumable,
+    # never the job timeout.
+    it "fails named and resumable once the total replace deadline is spent" do
+      file = @dir.join("SHA256SUMS.txt").tap { |path| path.write("fresh sums") }
+      store.set_content(
+        "https://github.com/tamatebako/tebako-runtime-ruby/releases/download/v#{SPEC_VERSION}/SHA256SUMS.txt",
+        "stale sums"
+      )
+      (4 * TebakoRelease::Uploader::METADATA_CONVERGENCE_DELAYS.size).times do
+        store.fail_next(:upload, Octokit::UnprocessableEntity.new)
+      end
+      clock = 0.0
+      allow(fake_manager).to receive(:monotonic_now) { clock += 300.0 }
+
+      expect { fake_manager.force_upload(release, file) }
+        .to raise_error(/could not converge SHA256SUMS\.txt.*convergence deadline.*re-run this leg/m)
+      expect(store.attempts[:upload]).to be < (4 * TebakoRelease::Uploader::METADATA_CONVERGENCE_DELAYS.size)
+    end
+
     it "retries transport-level drops on the upload path (stale keep-alive SSL EOF), escalating" do
       store.fail_next(:upload, OpenSSL::SSL::SSLError.new("SSL_read: unexpected eof while reading"))
       exe = package("tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64")
@@ -1103,10 +1131,6 @@ RSpec.describe TebakoRelease::Uploader do
 
     before { allow(fake_manager).to receive(:sleep) }
 
-    def too_many_requests(headers = {})
-      Octokit::TooManyRequests.new(status: 403, body: "API rate limit exceeded", response_headers: headers)
-    end
-
     it "sleeps until the window's named reset and retries instead of dying" do
       reset = Time.now.to_i + 30
       store.fail_next(:listing, too_many_requests("x-ratelimit-reset" => reset.to_s))
@@ -1124,12 +1148,43 @@ RSpec.describe TebakoRelease::Uploader do
       expect(fake_manager).to have_received(:sleep).with(a_value_between(17, 23))
     end
 
-    it "waits a default minute when the response names neither reset nor retry-after" do
+    it "backs off exponentially from 30s when the response names no window (the secondary-limit shape)" do
+      store.fail_next(:listing, too_many_requests)
       store.fail_next(:listing, too_many_requests)
 
       fake_manager.all_assets(release)
 
-      expect(fake_manager).to have_received(:sleep).with(TebakoRelease::Uploader::RATE_LIMIT_DEFAULT_WAIT)
+      expect(fake_manager).to have_received(:sleep).with(30).once
+      expect(fake_manager).to have_received(:sleep).with(60).once
+      expect(store.attempts[:listing]).to eq(3)
+    end
+
+    it "caps the headerless backoff at ten minutes" do
+      8.times { store.fail_next(:listing, too_many_requests) }
+
+      fake_manager.all_assets(release)
+
+      expect(fake_manager).to have_received(:sleep).with(600).exactly(3).times
+      expect(store.attempts[:listing]).to eq(9)
+    end
+
+    # A bare 429 arrives as a plain ClientError (octokit maps only 403s
+    # with a quota body to TooManyRequests) — it is the same quota class.
+    it "treats a bare 429 as a quota response" do
+      store.fail_next(:listing, Octokit::ClientError.new(status: 429, body: "429 Too Many Requests",
+                                                         response_headers: { "retry-after" => "1" }))
+
+      fake_manager.all_assets(release)
+
+      expect(store.attempts[:listing]).to eq(2)
+      expect(fake_manager).to have_received(:sleep).with(6)
+    end
+
+    it "never retries a non-quota client error (a 404 keeps its semantics)" do
+      store.fail_next(:listing, Octokit::NotFound.new(status: 404, body: "Not Found", response_headers: {}))
+
+      expect { fake_manager.all_assets(release) }.to raise_error(Octokit::NotFound)
+      expect(store.attempts[:listing]).to eq(1)
     end
 
     it "never spends transient attempts on rate-limit responses" do
@@ -1157,6 +1212,18 @@ RSpec.describe TebakoRelease::Uploader do
       expect { fake_manager.all_assets(release) }
         .to raise_error(TebakoRelease::Uploader::RateLimitBudgetExhausted, /rate-limit/)
       expect(fake_manager).not_to have_received(:sleep)
+    end
+
+    # The per-call bound (run 37061404844's lesson the other way: a leg
+    # that keeps eating quota starves the fleet) — the ninth absorbed
+    # quota response raises the named, resumable error.
+    it "gives up named after the per-call quota attempt budget is spent" do
+      budget = TebakoRelease::Uploader::RATE_LIMIT_ATTEMPTS
+      (budget + 1).times { store.fail_next(:listing, too_many_requests("retry-after" => "1")) }
+
+      expect { fake_manager.all_assets(release) }
+        .to raise_error(TebakoRelease::Uploader::RateLimitBudgetExhausted, /budget is exhausted/)
+      expect(store.attempts[:listing]).to eq(budget + 1)
     end
   end
 
@@ -1870,10 +1937,29 @@ RSpec.describe TebakoRelease::Uploader do
     it "fails named when the loser release never becomes visible" do
       allow(client).to receive(:release_for_tag).and_raise(Octokit::NotFound)
       store.fail_next(:create, Octokit::UnprocessableEntity.new)
-      stub_const("TebakoRelease::Uploader::RELEASE_CREATE_POLL_DELAYS", [0, 0])
+      stub_const("TebakoRelease::Convergence::RELEASE_VISIBILITY_DELAYS", [0, 0])
 
       expect { fake_manager.get_or_create_release }
         .to raise_error(/rejected the create.*never became visible/)
+    end
+
+    # Run 37061404844: 64 of ~90 legs died on a terminal 403 mid-fan-out.
+    # The read and the create POST both ride the window out now.
+    it "rides out a rate-limit response on the release read instead of dying" do
+      store.fail_next(:release_for_tag, too_many_requests("retry-after" => "1"))
+
+      expect(fake_manager.get_or_create_release).to eq(client.release)
+      expect(store.attempts[:release_for_tag]).to eq(2)
+      expect(store.creates).to be_empty
+    end
+
+    it "rides out a rate-limit response on the create POST" do
+      allow(client).to receive(:release_for_tag).and_raise(Octokit::NotFound)
+      store.fail_next(:create, too_many_requests("retry-after" => "1"))
+
+      expect(fake_manager.get_or_create_release).to eq(client.release)
+      expect(store.attempts[:create]).to eq(2)
+      expect(fake_manager).to have_received(:sleep).with(6)
     end
   end
 
