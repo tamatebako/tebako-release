@@ -5,5 +5,5 @@
 # This file is a part of tamatebako
 
 module TebakoRelease
-  VERSION = "0.5.0"
+  VERSION = "0.5.1"
 end
