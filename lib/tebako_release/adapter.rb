@@ -47,6 +47,16 @@ module TebakoRelease
       "\\d+\\.\\d+\\.\\d+"
     end
 
+    # The language segment of the package-name grammar
+    # (`tebako-runtime-<ver>-<lang>-<lv>-<triplet>` — tebako#716):
+    # declared by factories publishing the post-#716 spelling. Default
+    # nil — the pre-#716 spelling carried no language segment, and this
+    # machinery keeps composing/parsing it for the immutable releases
+    # that already carry it.
+    def lang_name
+      nil
+    end
+
     # Spec 36's publish shape: when true, each leg publishes ONE bundle
     # (<stem>.tar.gz — exe + env image + DLLs + in-bundle SHA256SUMS) plus
     # its sidecar and shard, instead of the per-file asset enumeration.

@@ -49,3 +49,11 @@ class CopublishSpecAdapter < BundleSpecAdapter
     true
   end
 end
+
+# The tebako#716-era adapter: a factory declaring the language segment
+# of the post-#716 package-name spelling.
+class LangSpecAdapter < SpecAdapter
+  def lang_name
+    "ruby"
+  end
+end
