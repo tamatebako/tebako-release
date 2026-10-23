@@ -425,7 +425,46 @@ module TebakoRelease
     # of burning polls). Creation is write-once, never a wedge.
     def get_or_create_release # rubocop:disable Naming/AccessorMethodName
       puts "Looking for release with tag: #{@tag}"
-      find_release || create_release_race_safe
+      release = find_release
+      return release if release
+
+      canonicalize_created_release(create_release_race_safe)
+    end
+
+    # GitHub does not enforce tag_name uniqueness atomically: two
+    # concurrent creates can BOTH commit (200, never the loser's 422), and
+    # the tag then resolves to one object while the other — same
+    # tag_name, different id — stays API-addressable. A leg holding that
+    # ghost uploads to it, reports success, and its bytes are unreachable
+    # (tebako-release#19: the v0.17.1 publish's seven arm64 assets, found
+    # only because another leg's audit named them missing).
+    #
+    # So a create is never trusted on its own answer: the tag's own
+    # resolution is re-read and adopted. The leg then uploads where
+    # consumers look, and a duplicate is named with the remedy — it is
+    # never deleted here (a delete is the owner's call, and the ghost can
+    # only ever hold orphaned bytes).
+    def canonicalize_created_release(created)
+      canonical = await_tag_resolution
+      return canonical if canonical.id == created.id
+
+      puts "::warning::#{@tag} resolves to release #{canonical.id}, but this leg created #{created.id} — " \
+           "a duplicate release object exists for the tag; uploading to #{canonical.id}. " \
+           "Delete #{created.id} (it holds no reachable bytes)."
+      canonical
+    end
+
+    # The tag's resolution, polled over the release-visibility budget: a
+    # create that lands is not instantly readable by tag.
+    def await_tag_resolution
+      RELEASE_VISIBILITY_DELAYS.each do |pause|
+        release = find_release
+        return release if release
+
+        sleep pause
+      end
+      raise "the release for #{@tag} was created but the tag does not resolve to any release — " \
+            "the create's answer and the tag disagree; delete the stray release object and re-run this leg"
     end
 
     # A rescue clause's own exceptions never re-enter the sibling rescues —
