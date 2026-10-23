@@ -73,9 +73,9 @@ end
 class FakeRelease
   attr_reader :id, :url, :rels
 
-  def initialize(store)
-    @id = 42
-    @url = "https://api.github.test/releases/42"
+  def initialize(store, id: 42)
+    @id = id
+    @url = "https://api.github.test/releases/#{id}"
     @rels = { assets: FakeAssetsRel.new(store) }
   end
 end
@@ -1891,13 +1891,25 @@ RSpec.describe TebakoRelease::Uploader do
 
     before { allow(fake_manager).to receive(:sleep) }
 
+    # The realistic visibility model: the tag resolves before the create
+    # (the earlier leg's release) and again once the create has landed.
+    # A stub that misses forever would model a create that never becomes
+    # readable by tag — its own separate case below.
+    def tag_resolves_once_created
+      allow(client).to receive(:release_for_tag) do
+        raise Octokit::NotFound if store.creates.empty?
+
+        client.release
+      end
+    end
+
     it "returns the existing release without creating when the tag resolves" do
       expect(fake_manager.get_or_create_release.url).to eq(release.url)
       expect(store.creates).to be_empty
     end
 
     it "creates the release with the static notes when the tag is missing" do
-      allow(client).to receive(:release_for_tag).and_raise(Octokit::NotFound)
+      tag_resolves_once_created
 
       expect(fake_manager.get_or_create_release.url).to eq(release.url)
 
@@ -1912,13 +1924,46 @@ RSpec.describe TebakoRelease::Uploader do
 
     it "targets TEBAKO_RELEASE_TAG when set (the line-shard override)" do
       ENV["TEBAKO_RELEASE_TAG"] = "v#{SPEC_VERSION}-ruby9.9"
-      allow(client).to receive(:release_for_tag).and_raise(Octokit::NotFound)
+      tag_resolves_once_created
 
       # Fresh manager: the describe's before hook instantiates the let
       # (for the sleep stub) before this example's env is set.
       described_class.new(client: client).get_or_create_release
 
       expect(store.create_tags).to eq(["v#{SPEC_VERSION}-ruby9.9"])
+    end
+
+    # tebako-release#19: GitHub's tag_name uniqueness is not atomic, so a
+    # concurrent create can commit TWICE (200, not a 422). The tag then
+    # resolves to one object and the other — same tag_name, different id —
+    # still accepts uploads. A leg that trusts its own create's answer
+    # uploads to the ghost: green job, unreachable bytes.
+    it "adopts the tag's own resolution when its create answered with a duplicate" do
+      ghost = FakeRelease.new(store, id: 43)
+      created = false
+      allow(client).to receive(:create_release) do
+        created = true
+        ghost
+      end
+      allow(client).to receive(:release_for_tag) do
+        raise Octokit::NotFound unless created
+
+        release
+      end
+
+      expect do
+        expect(fake_manager.get_or_create_release.url).to eq(release.url)
+      end.to output(/duplicate release object exists for the tag/).to_stdout
+    end
+
+    it "fails named when its create never resolves by tag" do
+      ghost = FakeRelease.new(store, id: 43)
+      allow(client).to receive(:create_release).and_return(ghost)
+      allow(client).to receive(:release_for_tag).and_raise(Octokit::NotFound)
+      stub_const("TebakoRelease::Convergence::RELEASE_VISIBILITY_DELAYS", [0, 0])
+
+      expect { fake_manager.get_or_create_release }
+        .to raise_error(/does not resolve to any release/)
     end
 
     it "rides the winner's release when the create loses the race (422)" do
@@ -1954,7 +1999,7 @@ RSpec.describe TebakoRelease::Uploader do
     end
 
     it "rides out a rate-limit response on the create POST" do
-      allow(client).to receive(:release_for_tag).and_raise(Octokit::NotFound)
+      tag_resolves_once_created
       store.fail_next(:create, too_many_requests("retry-after" => "1"))
 
       expect(fake_manager.get_or_create_release).to eq(client.release)
