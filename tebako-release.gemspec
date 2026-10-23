@@ -22,6 +22,12 @@ Gem::Specification.new do |spec|
   spec.executables = ["tebako-release"]
   spec.require_paths = ["lib"]
 
+  # octokit requires `base64`, which stopped being a default gem in ruby
+  # 3.4 — a consumer on 3.4+ dies at load with `cannot load such file --
+  # base64` unless the dependency is declared (found by the jruby
+  # factory's signing port). No floor needed: every supported ruby
+  # resolves it, and 3.3 simply gets the default gem's copy.
+  spec.add_dependency "base64"
   spec.add_dependency "octokit", "~> 7.1"
 
   spec.metadata["rubygems_mfa_required"] = "true"
