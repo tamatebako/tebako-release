@@ -144,6 +144,7 @@ module TebakoRelease
         stale = stale_targets(targets, assets)
         puts "#{@tag}: #{targets.size} signature targets, #{stale.size} need (re)signing"
         by_name = assets.to_h { |asset| [asset.name, asset] }
+        converged = []
         stale.each do |name|
           digest = listed_sha(by_name.fetch(name))
           if digest.empty?
@@ -153,8 +154,9 @@ module TebakoRelease
           end
 
           sign_one(work, key_file, tool, release, name, digest, by_name["#{name}.asc"])
+          converged << name
         end
-        assert_coverage!(release, targets)
+        assert_coverage!(targets, stale, converged)
       end
       :signed
     end
@@ -458,12 +460,20 @@ module TebakoRelease
         .find { |asset| asset.name == name }
     end
 
-    # The coverage assertion: after the pass, every target has a .asc on
-    # the release — a partially signed release is a named failure, never a
+    # The coverage assertion, without a re-listing (tebako-release#3): a
+    # target is covered when its .asc was already fresh at the pass-start
+    # listing (not stale) or its upload was converged this pass — and
+    # converge_asc proves convergence on the single-asset endpoint with
+    # the served digest equal to our bytes, which is exactly the server
+    # truth a fresh listing would re-read. The full listing at this point
+    # cost ~5 pages per leg at catalog size with nothing to add: legs own
+    # disjoint name sets (SIGN_ONLY_STEMS), so no other writer can touch
+    # a name this pass covers. The computation stays: a target that is
+    # neither fresh-at-start nor converged is a named failure, never a
     # quiet state.
-    def assert_coverage!(release, targets)
-      names = with_transient_retries("release assets") { @client.release_assets(release.url) }.map(&:name)
-      missing = targets.reject { |name| names.include?("#{name}.asc") }
+    def assert_coverage!(targets, stale, converged)
+      covered = (targets - stale) | converged
+      missing = targets - covered
       return if missing.empty?
 
       raise SigningGateError,

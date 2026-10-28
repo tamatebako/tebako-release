@@ -474,8 +474,9 @@ RSpec.describe TebakoRelease::Signer do
     expect(signer.sign_release).to eq(:signed)
 
     # The failed listing re-asked inside the wrapper: tool listing (403 +
-    # retry) + pass-start + coverage.
-    expect(client.attempts[:release_assets]).to eq(4)
+    # retry) + pass-start. The coverage assertion reads the pass's own
+    # convergence records (tebako-release#3) — no re-listing.
+    expect(client.attempts[:release_assets]).to eq(3)
   end
 
   it "converges on a release object a concurrent leg just created (read-after-create visibility)" do
@@ -571,14 +572,16 @@ RSpec.describe TebakoRelease::Signer do
 
     expect(signer.sign_release).to eq(:signed)
 
-    # The full listings: the tool release, the pass-start, the coverage
-    # assertion — never a re-listing per convergence cycle.
-    expect(client.attempts[:release_assets]).to eq(3)
+    # The full listings: the tool release and the pass-start one — never a
+    # re-listing per convergence cycle, and no coverage re-listing
+    # (tebako-release#3: the per-name convergence records ARE the coverage
+    # proof).
+    expect(client.attempts[:release_assets]).to eq(2)
     # The convergence polls ride the single-asset endpoint, one per cycle.
     expect(client.attempts[:release_asset]).to eq(2)
-    # Two signed targets, nine requests in total — the catalog fleet's
+    # Two signed targets, eight requests in total — the catalog fleet's
     # ~90 legs stay far inside the token's 5,000/h window.
-    expect(client.attempts.values.sum).to eq(9)
+    expect(client.attempts.values.sum).to eq(8)
   end
 
   it "budgets the convergence window for campaign-scale concurrency (tebako-release#15)" do
