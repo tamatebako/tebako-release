@@ -102,13 +102,20 @@ module TebakoRelease
 
     # Class (a): an unconditional call. Rate-limit responses ride out
     # (never consuming the transient attempts); transport drops retry with
-    # escalating waits; every other error propagates to the caller's own
-    # semantics untouched.
+    # escalating waits; the gateway trio of 5xx (502/503/504 — GitHub's
+    # side failing, the request never wrong) rides the same policy, while
+    # every other server error keeps its semantics — a 500 is a bug's
+    # signature, not a window's (tebako#1048: a 502 on the audit's asset
+    # pagination once failed an otherwise-green publish because ServerError
+    # was in no rescue set); every other error propagates to the caller's
+    # own semantics untouched.
     def with_transient_retries(target = "GitHub call", attempts: TRANSIENT_ATTEMPTS) # rubocop:disable Metrics/MethodLength
       budget = attempts
       with_rate_limit_rideout(target) do
         yield
-      rescue *TRANSIENT_ERRORS => e
+      rescue *TRANSIENT_ERRORS, Octokit::ServerError => e
+        raise if e.is_a?(Octokit::ServerError) && !transient_server_error?(e)
+
         attempts -= 1
         raise if attempts <= 0
 
@@ -117,6 +124,16 @@ module TebakoRelease
         sleep delay
         retry
       end
+    end
+
+    # The retryable server class: the gateway trio only. A bare-raised
+    # error carries no response — and no claim of transience.
+    def transient_server_error?(error)
+      return false unless error.is_a?(Octokit::ServerError)
+
+      [502, 503, 504].include?(error.response_status.to_i)
+    rescue NoMethodError
+      false
     end
 
     # The quota ride-out, bounded twice (RATE_LIMIT_ATTEMPTS per call,
