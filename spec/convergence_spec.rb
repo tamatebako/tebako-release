@@ -117,7 +117,7 @@ RSpec.describe TebakoRelease::Convergence do
   # tebako#1048: a 502 on the audit's asset pagination escaped exactly
   # this rescue boundary and failed an otherwise-green publish.
   def server_error(status)
-    Octokit::ServerError.new(status: status, body: "#{status}", response_headers: {})
+    Octokit::ServerError.new(status: status, body: status.to_s, response_headers: {})
   end
 
   it "retries a 502 as a transient server error and returns the first success" do
