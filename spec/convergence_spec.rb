@@ -111,6 +111,46 @@ RSpec.describe TebakoRelease::Convergence do
     expect(harness.calls).to eq(1)
   end
 
+  # Octokit 7 raises the 5xx class as Octokit::ServerError (not a
+  # ClientError, so the quota ride-out never sees it). The gateway trio
+  # rides the transient policy; every other 5xx keeps its semantics.
+  # tebako#1048: a 502 on the audit's asset pagination escaped exactly
+  # this rescue boundary and failed an otherwise-green publish.
+  def server_error(status)
+    Octokit::ServerError.new(status: status, body: "#{status}", response_headers: {})
+  end
+
+  it "retries a 502 as a transient server error and returns the first success" do
+    script.replace([server_error(502), :ok])
+
+    expect(harness.with_transient_retries("listing") { harness.github_roundtrip }).to eq(:ok)
+    expect(harness.calls).to eq(2)
+  end
+
+  it "retries the whole gateway trio (502, 503, 504)" do
+    script.replace([server_error(502), server_error(503), server_error(504), :ok])
+
+    expect(harness.with_transient_retries("listing") { harness.github_roundtrip }).to eq(:ok)
+    expect(harness.calls).to eq(4)
+  end
+
+  it "never retries a 500 — a bug's signature is not a window's" do
+    script.replace([server_error(500)])
+
+    expect { harness.with_transient_retries("listing") { harness.github_roundtrip } }
+      .to raise_error(Octokit::ServerError)
+    expect(harness.calls).to eq(1)
+    expect(harness).not_to have_received(:sleep)
+  end
+
+  it "exhausts the transient budget on a persistent 502 and raises" do
+    script.replace(Array.new(described_class::TRANSIENT_ATTEMPTS + 1) { server_error(503) })
+
+    expect { harness.with_transient_retries("listing") { harness.github_roundtrip } }
+      .to raise_error(Octokit::ServerError)
+    expect(harness.calls).to eq(described_class::TRANSIENT_ATTEMPTS)
+  end
+
   # The per-call bound (run 37061404844's lesson: a leg that keeps eating
   # quota starves the fleet) — the ninth absorbed quota response raises
   # the named, resumable error instead of sleeping again.
