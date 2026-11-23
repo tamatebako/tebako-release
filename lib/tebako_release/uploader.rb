@@ -1429,11 +1429,29 @@ module TebakoRelease
     end
 
     # The non-executable artifacts a package is expected to carry: the
-    # filesystem image everywhere, the runtime DLL on windows.
+    # filesystem image everywhere, and the runtime DLL on windows WHEN the
+    # factory ships that facet (the ruby/python shape: the exe's imports
+    # resolve against the PE sibling the store materializes). An
+    # exec-cache runtime — the openjdk shape, julia among them — carries
+    # the whole SDK tree (libjulia & co.) in the env image, which the
+    # driver materializes host-side; it declares no DLL install name and
+    # the gate must never demand the facet it never publishes.
     def expected_facets(name)
       facets = ["#{name}.tfs"]
-      facets << "#{name}.dll" if name.include?("windows")
+      facets << "#{name}.dll" if name.include?("windows") && dll_facet?(name)
       facets
+    end
+
+    # Whether the package owes a windows runtime-DLL facet, per the
+    # adapter's dll_install_name declaration (nil → the runtime ships no
+    # DLL facet). An unparseable name keeps the expectation — the closed
+    # gate: a drifted name grammar must never silently shrink a release's
+    # expected asset set.
+    def dll_facet?(name)
+      version, host_id = parse_package_filename(name)
+      return true if version.nil?
+
+      !@config.adapter.dll_install_name(version, host_id).nil?
     end
 
     # The metadata a landed package owes: one sidecar per landed asset plus
@@ -1446,11 +1464,13 @@ module TebakoRelease
       expected.reject { |asset| present.include?(asset) }
     end
 
-    # The windows legs ship the runtime DLL as a third artifact: a windows
-    # executable without its DLL cannot load any native extension, and an
-    # unowned DLL means a leg's upload never landed.
+    # The windows legs of a DLL-facet factory (ruby/python) ship the
+    # runtime DLL as a third artifact: a windows executable without its
+    # DLL cannot load any native extension, and an unowned DLL means a
+    # leg's upload never landed. Exec-cache runtimes (the openjdk shape)
+    # declare no facet and are never warned about (dll_facet?).
     def report_dll_gaps(executables, dlls)
-      windows = executables.select { |name| name.include?("windows") }
+      windows = executables.select { |name| name.include?("windows") && dll_facet?(name) }
       (windows - dlls).sort.each do |name|
         puts "::warning::Runtime package #{name} has no runtime DLL (#{name}.dll); " \
              "the windows runtime cannot load native extensions without it"

@@ -393,6 +393,23 @@ RSpec.describe TebakoRelease::Uploader do
       .to_stdout
   end
 
+  # The exec-cache shape (openjdk, julia): no windows DLL facet exists —
+  # the warning must not fire for a factory that never ships one (an
+  # orphan DLL is still always suspicious).
+  it "stays quiet about a facet-less factory's windows package, still flags an orphan" do
+    config = TebakoRelease::Config.new(repo: "tamatebako/tebako-runtime-julia", language: "julia",
+                                       title_prefix: "Tebako julia runtime packages",
+                                       contract_yml: File.join(REPO_ROOT, "spec", "fixtures", "contract.yml"),
+                                       adapter: ExecCacheSpecAdapter.new)
+    facetless = described_class.new(config: config)
+    exe = package("tebako-runtime-#{SPEC_VERSION}-1.13.4-windows-ucrt64.exe")
+    orphan = package("tebako-runtime-#{SPEC_VERSION}-4.0.6-windows-ucrt64.dll")
+
+    expect { facetless.report_missing_packages([exe, orphan]) }
+      .to output(/4\.0\.6-windows-ucrt64\.dll has no matching/).to_stdout
+    expect { facetless.report_missing_packages([exe]) }.not_to output(/has no runtime DLL/).to_stdout
+  end
+
   it "keeps pre-image manifest consumers working (existing keys unchanged)" do
     exe = package("tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64")
     img = package("tebako-runtime-#{SPEC_VERSION}-3.3.7-macos-arm64.tfs")
@@ -682,6 +699,39 @@ RSpec.describe TebakoRelease::Uploader do
       expect { fake_manager.verify_completeness(release) }
         .to raise_error(/incomplete.*1 missing/)
         .and output(/Missing asset: #{stem}\.dll/).to_stdout
+    end
+
+    # The exec-cache shape (openjdk, julia): the env image carries the
+    # whole SDK tree and the driver materializes it host-side — no
+    # windows DLL facet exists or is needed, and the gate must not demand
+    # one (tebako-runtime-julia's first publish died on the unconditional
+    # expectation).
+    context "when the factory ships no windows DLL facet (the exec-cache shape)" do
+      let(:exec_cache_config) do
+        TebakoRelease::Config.new(repo: "tamatebako/tebako-runtime-julia", language: "julia",
+                                  title_prefix: "Tebako julia runtime packages",
+                                  contract_yml: File.join(REPO_ROOT, "spec", "fixtures", "contract.yml"),
+                                  adapter: ExecCacheSpecAdapter.new)
+      end
+      let(:fake_manager) { described_class.new(client: FakeClient.new(store), config: exec_cache_config) }
+
+      around do |example|
+        old = ENV.fetch("EXPECTED_JULIA_MATRIX", nil)
+        ENV["EXPECTED_JULIA_MATRIX"] = '["1.13.4"]'
+        example.run
+      ensure
+        old.nil? ? ENV.delete("EXPECTED_JULIA_MATRIX") : ENV["EXPECTED_JULIA_MATRIX"] = old
+      end
+
+      it "passes with the exe, its image, and their metadata — no .dll on the release" do
+        ENV["EXPECTED_ENV_MATRIX"] = '[{"host":"windows-latest","container":null,"os":"windows","arch":"x86_64"}]'
+        stem = "tebako-runtime-#{SPEC_VERSION}-1.13.4-windows-ucrt64"
+        ["#{stem}.exe", "#{stem}.tfs",
+         "#{stem}.manifest.json", "#{stem}.exe.sha256", "#{stem}.tfs.sha256"]
+          .each_with_index { |name, index| store.assets << FakeAsset.new(index + 1, name) }
+
+        expect { fake_manager.verify_completeness(release) }.not_to raise_error
+      end
     end
 
     it "warns and passes when no expected matrix is available" do

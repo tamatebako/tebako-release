@@ -57,3 +57,12 @@ class LangSpecAdapter < SpecAdapter
     "ruby"
   end
 end
+
+# The exec-cache shape (openjdk, julia): the env image carries the whole
+# SDK tree and the driver materializes it host-side, so the factory
+# ships no windows DLL facet — dll_install_name stays nil.
+class ExecCacheSpecAdapter < SpecAdapter
+  def dll_install_name(_version, _host_id)
+    nil
+  end
+end
